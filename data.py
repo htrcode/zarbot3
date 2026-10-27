@@ -127,6 +127,7 @@ def create_invoice(
     due: str,
     service: str,
     created_by: str,
+    company: str = "",
 ) -> Dict[str, Any]:
     data = _load()
     number = f"INV-{data['next_invoice']}"
@@ -143,6 +144,7 @@ def create_invoice(
         "created_by": created_by,
         "paid_at": None,
         "paid_method": None,
+        "company": (company or "").strip().lower(),
     }
     data["invoices"].append(record)
     _save(data)
@@ -157,6 +159,7 @@ def mark_paid(
     server_uuid: str,
     remarks: str,
     paid_by: str,
+    company: str = "",
 ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
     """Mark an invoice paid and record the matching sale.
 
@@ -173,9 +176,11 @@ def mark_paid(
         return None
 
     method = method.strip() or "unspecified"
+    chosen = (company or target.get("company") or "").strip().lower()
     target["status"] = "paid"
     target["paid_at"] = _stamp()
     target["paid_method"] = method
+    target["company"] = chosen
 
     sale = {
         "date": _today(),
@@ -189,6 +194,7 @@ def mark_paid(
         "transaction_id": transaction_id.strip(),
         "remarks": remarks.strip(),
         "invoice": target["number"],
+        "company": chosen,
         "created_at": _stamp(),
         "recorded_by": paid_by,
     }
@@ -200,13 +206,18 @@ def mark_paid(
 # --------------------------------------------------------------------------
 # sales (payments received)
 # --------------------------------------------------------------------------
-def payments(start: str = "") -> List[Dict[str, Any]]:
-    rows = [p for p in _load()["payments"] if _entry_date(p) >= start]
+def _in_company(row: Dict[str, Any], company: Optional[str]) -> bool:
+    """Company filter: unset means every company (old records have no company)."""
+    return not company or str(row.get("company", "")) == company
+
+
+def payments(start: str = "", company: Optional[str] = None) -> List[Dict[str, Any]]:
+    rows = [p for p in _load()["payments"] if _entry_date(p) >= start and _in_company(p, company)]
     return sorted(rows, key=lambda p: (_entry_date(p), p.get("created_at", "")), reverse=True)
 
 
-def total_sales(start: str = "") -> float:
-    return round(sum(p["amount"] for p in payments(start)), 2)
+def total_sales(start: str = "", company: Optional[str] = None) -> float:
+    return round(sum(p["amount"] for p in payments(start, company)), 2)
 
 
 def add_payment(
@@ -221,6 +232,7 @@ def add_payment(
     remarks: str,
     date: str,
     recorded_by: str,
+    company: str = "",
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = _load()
@@ -235,6 +247,7 @@ def add_payment(
         "method": method.strip() or "unspecified",
         "transaction_id": transaction_id.strip(),
         "remarks": remarks.strip(),
+        "company": (company or "").strip().lower(),
         "created_at": _stamp(),
         "recorded_by": recorded_by,
     }
@@ -248,13 +261,14 @@ def add_payment(
 # --------------------------------------------------------------------------
 # expenses
 # --------------------------------------------------------------------------
-def expenses(start: str = "") -> List[Dict[str, Any]]:
-    rows = [e for e in _load()["expenses"] if str(e.get("date", "")) >= start]
+def expenses(start: str = "", company: Optional[str] = None) -> List[Dict[str, Any]]:
+    rows = [e for e in _load()["expenses"]
+            if str(e.get("date", "")) >= start and _in_company(e, company)]
     return sorted(rows, key=lambda e: (e.get("date", ""), e.get("created_at", "")), reverse=True)
 
 
-def total_expenses(start: str = "") -> float:
-    return round(sum(e["amount"] for e in expenses(start)), 2)
+def total_expenses(start: str = "", company: Optional[str] = None) -> float:
+    return round(sum(e["amount"] for e in expenses(start, company)), 2)
 
 
 def add_expense(
@@ -267,6 +281,7 @@ def add_expense(
     remarks: str,
     date: str,
     recorded_by: str,
+    company: str = "",
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = _load()
@@ -279,6 +294,7 @@ def add_expense(
         "paid_to": paid_to.strip(),
         "transaction_id": transaction_id.strip(),
         "remarks": remarks.strip(),
+        "company": (company or "").strip().lower(),
         "created_at": _stamp(),
         "recorded_by": recorded_by,
     }

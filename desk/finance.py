@@ -8,9 +8,11 @@ import ui
 from discord import app_commands
 from discord.ext import commands
 
+import config
 from desk.bridge import record_finance
 from desk.pdf_gen import pnl_pdf
-from desk.utils import fmt, parse_date, staff_interaction_check, to_cents, valid_month
+from desk.utils import (company_choices, fmt, parse_date, require_company, staff_interaction_check,
+                        to_cents, valid_month)
 from desk.views import DashboardView, simple_card
 
 log = logging.getLogger("invoice-bot.finance")
@@ -28,26 +30,32 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await staff_interaction_check(interaction)
 
-    async def _record(self, interaction, kind, amount, category, description, date):
+    async def _record(self, interaction, kind, amount, category, description, date, company_key):
         try:
+            company = require_company(company_key)
             cents = to_cents(amount)
             when = parse_date(date)
             tx_id = await self.bot.db.add_transaction(
-                interaction.user.id, kind, category, cents, description, when)
+                interaction.user.id, kind, category, cents, description, when, company_id=company.key)
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
-        # Keep Sales / Expense Statements in step with the books.
+        # Keep Sales / Expense Statements in step with the books — in this company's channel only.
+        statement = "Sales Statement" if kind == "income" else "Expense Statement"
         try:
-            await record_finance(self.bot, kind, category, cents, description, when,
-                                 interaction.user.display_name)
+            posted, message = await record_finance(
+                self.bot, kind, category, cents, description, when,
+                interaction.user.display_name, company_id=company.key)
         except Exception:
             log.exception("Could not post the %s statement", kind)
+            posted, message = False, "an unexpected error (it was logged)"
         icon = "➕" if kind == "income" else "➖"
-        statement = "Sales Statement" if kind == "income" else "Expense Statement"
+        note = (f"-# {statement} posted to {message}." if posted
+                else f"-# ⚠️ Saved, but the {statement} was not posted: {message}")
         await ui.say(interaction, f"{icon} {kind.title()} recorded\n"
-                     f"{ui._field('ID', f'#{tx_id}')}\n{ui._field('Category', category)}\n"
+                     f"{ui._field('ID', f'#{tx_id}')}\n{ui._field('Company', company.name)}\n"
+                     f"{ui._field('Category', category)}\n"
                      f"{ui._field('Amount', fmt(cents))}\n{ui._field('Details', description or '—')}\n"
-                     f"-# {statement} posted to the statements channel.")
+                     f"{note}")
 
     async def _ac(self, kind, current):
         cats = await self.bot.db.categories(kind)
@@ -56,20 +64,28 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
 
     # ---------- record ----------
     @app_commands.command(name="income", description="Record income (hosting revenue, other sales...)")
-    @app_commands.describe(date="YYYY-MM-DD, defaults to today (UTC)")
-    async def income(self, interaction: discord.Interaction, amount: app_commands.Range[float, 0.01, 100_000_000.0],
+    @app_commands.describe(company="Company this income belongs to",
+                           date="YYYY-MM-DD, defaults to today (UTC)")
+    @app_commands.choices(company=company_choices())
+    async def income(self, interaction: discord.Interaction,
+                     company: app_commands.Choice[str],
+                     amount: app_commands.Range[float, 0.01, 100_000_000.0],
                      category: str, description: str = "", date: Optional[str] = None):
-        await self._record(interaction, "income", amount, category, description, date)
+        await self._record(interaction, "income", amount, category, description, date, company.value)
 
     @income.autocomplete("category")
     async def _income_ac(self, interaction, current: str):
         return await self._ac("income", current)
 
     @app_commands.command(name="expense", description="Record an expense (servers, software, marketing, commissions...)")
-    @app_commands.describe(date="YYYY-MM-DD, defaults to today (UTC)")
-    async def expense(self, interaction: discord.Interaction, amount: app_commands.Range[float, 0.01, 100_000_000.0],
+    @app_commands.describe(company="Company this expense belongs to",
+                           date="YYYY-MM-DD, defaults to today (UTC)")
+    @app_commands.choices(company=company_choices())
+    async def expense(self, interaction: discord.Interaction,
+                      company: app_commands.Choice[str],
+                      amount: app_commands.Range[float, 0.01, 100_000_000.0],
                       category: str, description: str = "", date: Optional[str] = None):
-        await self._record(interaction, "expense", amount, category, description, date)
+        await self._record(interaction, "expense", amount, category, description, date, company.value)
 
     @expense.autocomplete("category")
     async def _expense_ac(self, interaction, current: str):
@@ -86,18 +102,23 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
 
     # ---------- history ----------
     @app_commands.command(name="transactions", description="Transaction history for a month")
-    @app_commands.choices(kind=KIND_CHOICES)
+    @app_commands.describe(company="Only show this company's transactions (default: all companies)")
+    @app_commands.choices(kind=KIND_CHOICES, company=company_choices())
     async def transactions(self, interaction: discord.Interaction, month: Optional[str] = None,
-                           kind: Optional[app_commands.Choice[str]] = None):
+                           kind: Optional[app_commands.Choice[str]] = None,
+                           company: Optional[app_commands.Choice[str]] = None):
         try:
             month = valid_month(month)
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
-        rows = await self.bot.db.transactions(month, kind.value if kind else None, limit=20)
-        lines = [f"`#{t['id']}` {t['occurred_on']} · {'➕' if t['kind'] == 'income' else '➖'} {t['category']} · "
+        rows = await self.bot.db.transactions(month, kind.value if kind else None, limit=20,
+                                              company_id=company.value if company else None)
+        lines = [f"`#{t['id']}` {t['occurred_on']} · {'➕' if t['kind'] == 'income' else '➖'} "
+                 f"{config.company_name(t.get('company_id'))} · {t['category']} · "
                  f"**{fmt(t['amount'])}** · {(t['description'] or '')[:40]}" for t in rows]
+        title = f"Transactions · {month}" + (f" · {company.name}" if company else "")
         await interaction.response.send_message(
-            view=simple_card(f"Transactions · {month}", "\n".join(lines) or "No transactions."), ephemeral=True)
+            view=simple_card(title, "\n".join(lines) or "No transactions."), ephemeral=True)
 
     @app_commands.command(name="void", description="Void a manual transaction (never deleted, kept in audit log)")
     async def void(self, interaction: discord.Interaction, transaction_id: int, reason: str):
@@ -117,23 +138,30 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
 
     # ---------- reports ----------
     @app_commands.command(name="dashboard", description="Monthly revenue, expenses and net profit")
-    async def dashboard(self, interaction: discord.Interaction, month: Optional[str] = None):
+    @app_commands.describe(company="Only report this company (default: all companies)")
+    @app_commands.choices(company=company_choices())
+    async def dashboard(self, interaction: discord.Interaction, month: Optional[str] = None,
+                        company: Optional[app_commands.Choice[str]] = None):
         try:
             month = valid_month(month)
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
-        report = await self.bot.db.month_report(month)
+        company_id = company.value if company else None
+        report = await self.bot.db.month_report(month, company_id)
         await interaction.response.send_message(
-            view=DashboardView(self.bot, report, await self.bot.db.outstanding()), ephemeral=True)
+            view=DashboardView(self.bot, report, await self.bot.db.outstanding(company_id)), ephemeral=True)
 
     @app_commands.command(name="pnl", description="Profit and Loss statement (PDF)")
-    async def pnl(self, interaction: discord.Interaction, month: Optional[str] = None):
+    @app_commands.describe(company="Only report this company (default: all companies)")
+    @app_commands.choices(company=company_choices())
+    async def pnl(self, interaction: discord.Interaction, month: Optional[str] = None,
+                  company: Optional[app_commands.Choice[str]] = None):
         try:
             month = valid_month(month)
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
         await interaction.response.defer(ephemeral=True, thinking=True)
-        report = await self.bot.db.month_report(month)
+        report = await self.bot.db.month_report(month, company.value if company else None)
         data = await asyncio.to_thread(pnl_pdf, report)
         filename = f"PnL-{month}.pdf"
         card = ui.file_card(f"Profit & Loss · {month}", ui._field("Net", fmt(report["net"])), filename)

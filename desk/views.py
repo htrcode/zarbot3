@@ -86,6 +86,7 @@ def invoice_blocks(inv: dict) -> tuple[str, str, str]:
         label += " (partially paid)"
     client = _esc(inv["client_name"]) + (f" ({_who(inv['client_discord_id'])})" if inv["client_discord_id"] else "")
     fields = "\n".join([
+        _f("Company", config.company_name(inv.get("company_id"))),
         _f("Client Name", client),
         _f("Client Contact", _esc(inv.get("client_contact") or "") or None),
         _f("Status", label),
@@ -355,12 +356,15 @@ class InvoiceView(discord.ui.LayoutView):
 # Finance dashboard
 # ---------------------------------------------------------------------------
 class DashboardView(discord.ui.LayoutView):
-    def __init__(self, bot, report: dict, outstanding: int):
+    def __init__(self, bot, report: dict, outstanding: int, company: str | None = None):
         super().__init__(timeout=900)
         self.bot, self.report, self.month = bot, report, report["month"]
+        self.company = company if company is not None else report.get("company")
         net = report["net"]
         inc = "\n".join(f"• {n}: {fmt(a)}" for n, a in report["income"]) or "• none"
         exp = "\n".join(f"• {n}: {fmt(a)}" for n, a in report["expenses"]) or "• none"
+        rev = "\n".join(f"• {n}: {fmt(a)}" for n, a in report.get("revenue_rows", [])) or "• none"
+        scope = config.company_name(self.company) if self.company else "All companies"
         row = discord.ui.ActionRow()
         for label, cb in (("◀ Prev", self.on_prev), ("Next ▶", self.on_next)):
             b = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
@@ -370,8 +374,10 @@ class DashboardView(discord.ui.LayoutView):
         pdf.callback = self.on_pdf
         row.add_item(pdf)
         items = ui.card_items(
-            f"Finance · {self.month}",
-            f"{_f('Revenue', fmt(report['revenue']))}\n{inc}",
+            f"Finance · {self.month} · {scope}",
+            f"{_f('Operating Revenue', fmt(report['revenue']))}\n{inc}",
+            f"{_f('Revenue Statements', fmt(report.get('revenue_total', 0)))}\n{rev}\n"
+            f"-# Investment is tracked separately and is not part of revenue or profit.",
             f"{_f('Expenses', fmt(report['expense_total']))}\n{exp}",
             f"{_f('Net Profit' if net >= 0 else 'Net Loss', fmt(net))}\n"
             f"{_f('Outstanding Invoices (all time)', fmt(outstanding))}",
@@ -386,8 +392,9 @@ class DashboardView(discord.ui.LayoutView):
 
     async def _go(self, interaction, delta):
         month = shift_month(self.month, delta)
-        report = await self.bot.db.month_report(month)
-        await interaction.response.edit_message(view=DashboardView(self.bot, report, await self.bot.db.outstanding()))
+        report = await self.bot.db.month_report(month, self.company)
+        await interaction.response.edit_message(view=DashboardView(
+            self.bot, report, await self.bot.db.outstanding(self.company), self.company))
 
     async def on_prev(self, interaction):
         await self._go(interaction, -1)
@@ -416,6 +423,7 @@ def ticket_blocks(ticket: dict, deal: dict | None = None, invoice: dict | None =
                   category: str | None = None) -> tuple[str, str]:
     fields = [
         _f("Type", f"{ticket['kind'].title()}"),
+        _f("Company", config.company_name(ticket.get("company_id"))),
         _f("Category", _esc(category) if category else "—"),
         _f("Subject", _esc(ticket["subject"][:180])),
         _f("Client Name", f"{_esc(ticket['client_name'])} ({_who(ticket.get('client_discord_id'))})"),

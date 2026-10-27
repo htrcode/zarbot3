@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     total INTEGER NOT NULL,
     notes TEXT,
     category_id INTEGER NOT NULL REFERENCES categories(id),
+    company_id TEXT,
     ticket_channel_id INTEGER,
     voided INTEGER NOT NULL DEFAULT 0,
     void_reason TEXT,
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS invoice_items (
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    company_id TEXT,
     amount INTEGER NOT NULL CHECK (amount > 0),
     method TEXT,
     note TEXT,
@@ -72,11 +74,23 @@ CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK (kind IN ('income','expense')),
     category_id INTEGER NOT NULL REFERENCES categories(id),
+    company_id TEXT,
     amount INTEGER NOT NULL CHECK (amount > 0),
     description TEXT,
     occurred_on TEXT NOT NULL,
     invoice_id INTEGER REFERENCES invoices(id),
     payment_id INTEGER REFERENCES payments(id),
+    voided INTEGER NOT NULL DEFAULT 0,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS revenue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id TEXT,
+    category TEXT NOT NULL CHECK (category IN ('Commission','Investment','General')),
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    description TEXT,
+    occurred_on TEXT NOT NULL,
     voided INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -104,6 +118,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     close_reason TEXT,
     transcript_path TEXT,
     deal_id INTEGER,
+    company_id TEXT,
     last_activity TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     opened_by INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -144,6 +159,9 @@ CREATE TABLE IF NOT EXISTS deal_events (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(occurred_on);
+CREATE INDEX IF NOT EXISTS idx_tx_company ON transactions(company_id);
+CREATE INDEX IF NOT EXISTS idx_revenue_date ON revenue(occurred_on);
+CREATE INDEX IF NOT EXISTS idx_revenue_company ON revenue(company_id);
 CREATE INDEX IF NOT EXISTS idx_pay_inv ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_channel ON tickets(channel_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
@@ -152,6 +170,9 @@ CREATE INDEX IF NOT EXISTS idx_deals_ticket ON deals(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage);
 CREATE INDEX IF NOT EXISTS idx_deals_followup ON deals(next_follow_up);
 """
+
+# Revenue statement categories. Investment is tracked apart from operating revenue.
+REVENUE_CATEGORIES = ("Commission", "Investment", "General")
 
 DEFAULT_CATEGORIES = [
     ("Hosting Revenue", "income"),
@@ -167,9 +188,12 @@ DEFAULT_CATEGORIES = [
 NEW_COLUMNS = {
     "invoices": {
         "client_contact": "TEXT", "delivered_at": "TEXT", "delivery_note": "TEXT",
+        "company_id": "TEXT",
     },
-    "payments": {"transaction_id": "TEXT"},
-    "tickets": {"purchase_completed_at": "TEXT", "panel_message_id": "INTEGER"},
+    "payments": {"transaction_id": "TEXT", "company_id": "TEXT"},
+    "transactions": {"company_id": "TEXT"},
+    "tickets": {"purchase_completed_at": "TEXT", "panel_message_id": "INTEGER",
+                "company_id": "TEXT"},
     "invoice_items": {
         "details": "TEXT", "product_type": "TEXT", "service_name": "TEXT",
         "node": "TEXT", "plan": "TEXT", "server_id": "TEXT", "delivery_link": "TEXT",
@@ -183,6 +207,10 @@ def invoice_number(invoice_id: int) -> str:
 
 def ticket_number(ticket_id: int) -> str:
     return f"{TICKET_PREFIX}-{ticket_id:04d}"
+
+
+def revenue_number(revenue_id: int) -> str:
+    return f"REV-{revenue_id:04d}"
 
 
 def _finish(inv: dict) -> dict:
@@ -340,7 +368,8 @@ class Database:
 
     # ---------- invoices ----------
     async def create_invoice(self, actor_id, *, client_discord_id, client_name, client_contact=None, items,
-                             due_days, tax_percent, discount_cents, category, notes, ticket_channel_id):
+                             due_days, tax_percent, discount_cents, category, notes, ticket_channel_id,
+                             company_id=None):
         category_id = await self.category_id(category, "income")
         lines = []
         for item in items:
@@ -363,11 +392,12 @@ class Database:
             try:
                 cur = await self.conn.execute(
                     """INSERT INTO invoices(client_discord_id, client_name, client_contact, issue_date, due_date, currency,
-                       subtotal, discount, tax_percent, tax, total, notes, category_id, ticket_channel_id, created_by)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       subtotal, discount, tax_percent, tax, total, notes, category_id, company_id,
+                       ticket_channel_id, created_by)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (client_discord_id, client_name, (client_contact or None), issue.isoformat(), due.isoformat(), CURRENCY,
                      subtotal, discount, tax_percent, tax, total, notes or None, category_id,
-                     ticket_channel_id, actor_id),
+                     (company_id or None), ticket_channel_id, actor_id),
                 )
                 invoice_id = cur.lastrowid
                 await self.conn.executemany(
@@ -377,7 +407,8 @@ class Database:
                     [(invoice_id, *l) for l in lines],
                 )
                 await self._audit(actor_id, "invoice.create", "invoice", invoice_id,
-                                  {"client": client_name, "total": total, "items": len(lines)})
+                                  {"client": client_name, "total": total, "items": len(lines),
+                                   "company": company_id})
                 await self._sync_deal_new_invoice(invoice_id, ticket_channel_id, total, actor_id)
                 await self.conn.commit()
             except Exception:
@@ -421,7 +452,8 @@ class Database:
         inv["paid"] = sum(p["amount"] for p in inv["payments"])
         return _finish(inv)
 
-    async def list_invoices(self, status: str | None = None, month: str | None = None, limit: int = 15):
+    async def list_invoices(self, status: str | None = None, month: str | None = None, limit: int = 15,
+                            company_id: str | None = None):
         rows = await self.fetchall(
             """SELECT i.*, COALESCE((SELECT SUM(amount) FROM payments p WHERE p.invoice_id=i.id),0) AS paid
                FROM invoices i ORDER BY i.id DESC"""
@@ -429,6 +461,8 @@ class Database:
         out = []
         for r in rows:
             inv = _finish(dict(r))
+            if company_id and inv.get("company_id") != company_id:
+                continue
             if month and not inv["issue_date"].startswith(month):
                 continue
             if status == "partial" and not (inv["is_partial"] and not inv["voided"]):
@@ -472,18 +506,18 @@ class Database:
             try:
                 paid_on = today().isoformat()
                 cur = await self.conn.execute(
-                    "INSERT INTO payments(invoice_id, amount, method, note, transaction_id, paid_at, created_by) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (invoice_id, amount, (method or "manual")[:40], (note or "")[:200],
+                    "INSERT INTO payments(invoice_id, company_id, amount, method, note, transaction_id, paid_at, created_by) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (invoice_id, inv.get("company_id"), amount, (method or "manual")[:40], (note or "")[:200],
                      (transaction_id or "").strip()[:100] or None, paid_on, actor_id),
                 )
                 pid = cur.lastrowid
                 # Auto-record the income so invoices and books never drift apart
                 await self.conn.execute(
                     """INSERT INTO transactions(kind, category_id, amount, description, occurred_on,
-                       invoice_id, payment_id, created_by) VALUES ('income',?,?,?,?,?,?,?)""",
+                       invoice_id, payment_id, company_id, created_by) VALUES ('income',?,?,?,?,?,?,?,?)""",
                     (inv["category_id"], amount, f"Payment for {inv['number']} ({inv['client_name']})",
-                     paid_on, invoice_id, pid, actor_id),
+                     paid_on, invoice_id, pid, inv.get("company_id"), actor_id),
                 )
                 await self._sync_deal_payment(invoice_id, inv, inv["paid"] + amount, actor_id)
                 await self._audit(actor_id, "payment.add", "invoice", invoice_id,
@@ -533,40 +567,43 @@ class Database:
             await self.conn.execute("UPDATE invoices SET overdue_notified=1 WHERE id=?", (invoice_id,))
             await self.conn.commit()
 
-    async def outstanding(self) -> int:
-        row = await self.fetchone(
-            """SELECT COALESCE(SUM(i.total - COALESCE(p.paid,0)),0) AS due FROM invoices i
+    async def outstanding(self, company_id: str | None = None) -> int:
+        sql = """SELECT COALESCE(SUM(i.total - COALESCE(p.paid,0)),0) AS due FROM invoices i
                LEFT JOIN (SELECT invoice_id, SUM(amount) paid FROM payments GROUP BY invoice_id) p
                ON p.invoice_id=i.id WHERE i.voided=0"""
-        )
+        params: list = []
+        if company_id:
+            sql += " AND i.company_id=?"
+            params.append(company_id)
+        row = await self.fetchone(sql, params)
         return row["due"]
 
     # ---------- gross sales ----------
-    async def gross_sales(self, month: str | None = None) -> int:
+    async def gross_sales(self, month: str | None = None, company_id: str | None = None) -> int:
         """Gross sales = all recorded income (invoice payments + manual income)."""
+        sql = "SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE voided=0 AND kind='income'"
+        params: list = []
         if month:
-            row = await self.fetchone(
-                """SELECT COALESCE(SUM(amount),0) AS total FROM transactions
-                   WHERE voided=0 AND kind='income' AND substr(occurred_on,1,7)=?""", (month,)
-            )
-        else:
-            row = await self.fetchone(
-                "SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE voided=0 AND kind='income'"
-            )
+            sql += " AND substr(occurred_on,1,7)=?"
+            params.append(month)
+        if company_id:
+            sql += " AND company_id=?"
+            params.append(company_id)
+        row = await self.fetchone(sql, params)
         return row["total"] or 0
 
     # ---------- tickets ----------
     async def create_ticket(self, actor_id, *, subject, kind, priority, client_discord_id, client_name,
-                            channel_id, parent_ticket_id=None, budget=0, service="", note=""):
+                            channel_id, parent_ticket_id=None, budget=0, service="", note="", company_id=None):
         async with self.lock:
             try:
                 now = today().isoformat()
                 cur = await self.conn.execute(
                     """INSERT INTO tickets(subject, kind, priority, status, client_discord_id, client_name,
-                       channel_id, parent_ticket_id, opened_by, last_activity)
-                       VALUES (?,?,?, 'open', ?,?,?,?,?,?)""",
+                       channel_id, parent_ticket_id, company_id, opened_by, last_activity)
+                       VALUES (?,?,?, 'open', ?,?,?,?,?,?,?)""",
                     (subject[:120], kind, priority, client_discord_id, client_name[:100], channel_id,
-                     parent_ticket_id, actor_id, now),
+                     parent_ticket_id, (company_id or None), actor_id, now),
                 )
                 ticket_id = cur.lastrowid
                 if note:
@@ -694,6 +731,25 @@ class Database:
                 "UPDATE tickets SET channel_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (channel_id, ticket_id)
             )
             await self._audit(actor_id, "ticket.channel", "ticket", ticket_id, {"channel_id": channel_id})
+            await self.conn.commit()
+        await self._touch(ticket_id=ticket_id)
+
+    async def set_ticket_company(self, actor_id, ticket_id, company_id):
+        """Set (or clear, with None) the financial company of a ticket.
+
+        Moving a ticket between Discord categories never touches this: the
+        category is a workflow label, the company is an accounting fact.
+        """
+        async with self.lock:
+            ticket = await self.fetchone("SELECT * FROM tickets WHERE id=?", (ticket_id,))
+            if not ticket:
+                raise ValueError("Ticket not found.")
+            await self.conn.execute(
+                "UPDATE tickets SET company_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (company_id or None, ticket_id),
+            )
+            await self._audit(actor_id, "ticket.company", "ticket", ticket_id,
+                              {"from": ticket["company_id"], "to": company_id})
             await self.conn.commit()
         await self._touch(ticket_id=ticket_id)
 
@@ -960,17 +1016,20 @@ class Database:
             "SELECT * FROM deal_events WHERE deal_id=? ORDER BY id DESC LIMIT ?", (deal_id, limit))]
 
     # ---------- transactions ----------
-    async def add_transaction(self, actor_id, kind, category, amount, description, occurred_on):
+    async def add_transaction(self, actor_id, kind, category, amount, description, occurred_on,
+                              company_id=None):
         if amount <= 0:
             raise ValueError("Amount must be above zero.")
         cid = await self.category_id(category, kind)
         async with self.lock:
             cur = await self.conn.execute(
-                "INSERT INTO transactions(kind, category_id, amount, description, occurred_on, created_by) VALUES (?,?,?,?,?,?)",
-                (kind, cid, amount, description[:200], occurred_on, actor_id),
+                """INSERT INTO transactions(kind, category_id, company_id, amount, description, occurred_on,
+                   created_by) VALUES (?,?,?,?,?,?,?)""",
+                (kind, cid, (company_id or None), amount, description[:200], occurred_on, actor_id),
             )
             await self._audit(actor_id, f"transaction.{kind}", "transaction", cur.lastrowid,
-                              {"category": category, "amount": amount, "date": occurred_on})
+                              {"category": category, "amount": amount, "date": occurred_on,
+                               "company": company_id})
             await self.conn.commit()
             return cur.lastrowid
 
@@ -988,31 +1047,97 @@ class Database:
                               {"reason": reason, "amount": row["amount"]})
             await self.conn.commit()
 
-    async def transactions(self, month: str, kind: str | None = None, limit: int = 20):
+    async def transactions(self, month: str, kind: str | None = None, limit: int = 20,
+                           company_id: str | None = None):
         sql = """SELECT t.*, c.name AS category FROM transactions t JOIN categories c ON c.id=t.category_id
                  WHERE t.voided=0 AND substr(t.occurred_on,1,7)=?"""
         params = [month]
         if kind:
             sql += " AND t.kind=?"
             params.append(kind)
+        if company_id:
+            sql += " AND t.company_id=?"
+            params.append(company_id)
         sql += " ORDER BY t.occurred_on DESC, t.id DESC LIMIT ?"
         params.append(limit)
         return [dict(r) for r in await self.fetchall(sql, params)]
 
-    async def month_report(self, month: str) -> dict:
+    # ---------- revenue statements (Commission / Investment / General) ----------
+    async def add_revenue(self, actor_id, company_id, category, amount, description, occurred_on):
+        """Record a revenue statement entry: unique REV id, company, category, amount, date, staff."""
+        if category not in REVENUE_CATEGORIES:
+            raise ValueError("Category must be one of: " + ", ".join(REVENUE_CATEGORIES) + ".")
+        if amount <= 0:
+            raise ValueError("Amount must be above zero.")
+        async with self.lock:
+            cur = await self.conn.execute(
+                """INSERT INTO revenue(company_id, category, amount, description, occurred_on, created_by)
+                   VALUES (?,?,?,?,?,?)""",
+                ((company_id or None), category, amount, (description or "")[:200], occurred_on, actor_id),
+            )
+            await self._audit(actor_id, "revenue.add", "revenue", cur.lastrowid,
+                              {"company": company_id, "category": category, "amount": amount,
+                               "date": occurred_on})
+            await self.conn.commit()
+            return cur.lastrowid
+
+    async def get_revenue(self, revenue_id: int):
+        row = await self.fetchone("SELECT * FROM revenue WHERE id=?", (revenue_id,))
+        return dict(row) if row else None
+
+    async def revenue_totals(self, month: str, company_id: str | None = None) -> dict:
+        """Per-category totals for a month (missing categories are absent from the dict)."""
+        sql = ("SELECT category, COALESCE(SUM(amount),0) AS total FROM revenue "
+               "WHERE voided=0 AND substr(occurred_on,1,7)=?")
+        params: list = [month]
+        if company_id:
+            sql += " AND company_id=?"
+            params.append(company_id)
+        sql += " GROUP BY category"
+        return {r["category"]: r["total"] for r in await self.fetchall(sql, params)}
+
+    async def list_revenue(self, month: str, company_id: str | None = None, limit: int = 25):
+        sql = "SELECT * FROM revenue WHERE voided=0 AND substr(occurred_on,1,7)=?"
+        params: list = [month]
+        if company_id:
+            sql += " AND company_id=?"
+            params.append(company_id)
+        sql += " ORDER BY occurred_on DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in await self.fetchall(sql, params)]
+
+    async def month_report(self, month: str, company_id: str | None = None) -> dict:
+        """Income, expenses and revenue for a month, optionally for one company.
+
+        ``revenue`` is *operating* revenue (invoice/manual income plus Commission
+        and General revenue statements). Investment contributions are reported in
+        ``revenue_rows``/``investment`` only, so they never inflate revenue or
+        profit, and no entry is ever counted twice.
+        """
+        where = "t.voided=0 AND substr(t.occurred_on,1,7)=?"
+        params: list = [month]
+        if company_id:
+            where += " AND t.company_id=?"
+            params.append(company_id)
         rows = await self.fetchall(
-            """SELECT c.name, t.kind, SUM(t.amount) AS total FROM transactions t
+            f"""SELECT c.name, t.kind, SUM(t.amount) AS total FROM transactions t
                JOIN categories c ON c.id=t.category_id
-               WHERE t.voided=0 AND substr(t.occurred_on,1,7)=?
+               WHERE {where}
                GROUP BY c.name, t.kind ORDER BY total DESC""",
-            (month,),
+            params,
         )
         income = [(r["name"], r["total"]) for r in rows if r["kind"] == "income"]
         expenses = [(r["name"], r["total"]) for r in rows if r["kind"] == "expense"]
-        revenue = sum(t for _, t in income)
+        rev = await self.revenue_totals(month, company_id)
+        investment = rev.get("Investment", 0)
+        statement_revenue = sum(v for k, v in rev.items() if k != "Investment")
+        revenue = sum(t for _, t in income) + statement_revenue
         spent = sum(t for _, t in expenses)
-        return {"month": month, "income": income, "expenses": expenses,
-                "revenue": revenue, "expense_total": spent, "net": revenue - spent}
+        return {"month": month, "company": company_id,
+                "income": income, "expenses": expenses,
+                "revenue": revenue, "expense_total": spent, "net": revenue - spent,
+                "revenue_rows": [(name, rev.get(name, 0)) for name in REVENUE_CATEGORIES],
+                "revenue_total": sum(rev.values()), "investment": investment}
 
     # ---------- audit ----------
     async def recent_audit(self, limit: int = 15):

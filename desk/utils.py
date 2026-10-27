@@ -1,11 +1,13 @@
 import datetime as dt
 import re
+import time
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import discord
+from discord import app_commands
 
-from config import CURRENCY, STAFF_ROLE_IDS, TIMEZONE
+from config import COMPANIES, CURRENCY, STAFF_ROLE_IDS, TIMEZONE, Company, get_company
 
 # Digital products the invoice form understands (type=... on an item line).
 PRODUCT_TYPES = ("VPS", "Game Panel", "Bot", "Plugin", "Fork", "Web Hosting", "Other")
@@ -280,6 +282,39 @@ def is_ticket_staff(user) -> bool:
     if user.guild_permissions.administrator or user.guild_permissions.manage_channels:
         return True
     return any(r.id in STAFF_ROLE_IDS or r.id in TICKET_STAFF_ROLE_IDS for r in user.roles)
+
+
+# ---------- companies ----------
+def company_choices() -> list[app_commands.Choice]:
+    """The configured companies as Discord choices (key as the value, display name as the label)."""
+    return [app_commands.Choice(name=c.name, value=c.key) for c in COMPANIES.values()]
+
+
+def require_company(value) -> Company:
+    """Company from a key or name; ValueError (for the user) when it is missing or unknown."""
+    company = get_company(value)
+    if company is None:
+        names = ", ".join(c.name for c in COMPANIES.values())
+        raise ValueError(f"Company must be one of: {names}.")
+    return company
+
+
+_recent_submissions: dict[tuple, float] = {}
+
+
+def duplicate_submission(key: tuple, window: float = 20.0) -> bool:
+    """True when the same staff member just submitted the same figures.
+
+    A cheap in-memory guard against double-clicks and repeated modal submits;
+    it never blocks a legitimate second entry after ``window`` seconds.
+    """
+    now = time.monotonic()
+    for old_key, stamp in list(_recent_submissions.items()):
+        if now - stamp > 120:
+            _recent_submissions.pop(old_key, None)
+    last = _recent_submissions.get(key)
+    _recent_submissions[key] = now
+    return last is not None and (now - last) < window
 
 
 async def staff_interaction_check(interaction: discord.Interaction) -> bool:

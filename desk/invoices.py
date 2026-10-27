@@ -4,12 +4,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+import config
 from config import LOG_CHANNEL_ID
 import data as store
 import ui
 from cogs.invoices import QuickInvoiceModal
-from desk.utils import (PRODUCT_TYPES, dmy, fmt, is_ticket_staff, normalize_product, parse_items,
-                   staff_interaction_check, to_cents, valid_month)
+from desk.utils import (PRODUCT_TYPES, company_choices, duplicate_submission, dmy, fmt, is_ticket_staff,
+                   normalize_product, parse_items, require_company, staff_interaction_check, to_cents,
+                   valid_month)
 from desk.views import (InvoiceView, STATUS_STYLE, _pdf_message, deliver_invoice,
                         send_invoice_to_channel, simple_card)
 
@@ -17,8 +19,16 @@ TicketChannel = Union[discord.TextChannel, discord.Thread]
 
 BOTH_STATUS = [app_commands.Choice(name=n, value=n) for n in ("unpaid", "partial", "overdue", "paid", "void")]
 
+# Shown in the item form; staff can type any configured company name.
+COMPANY_HINT = " / ".join(company.name for company in config.COMPANIES.values())
+
 
 class ItemsModal(discord.ui.Modal, title="Invoice items"):
+    company = discord.ui.TextInput(
+        label="Company",
+        placeholder=COMPANY_HINT,
+        max_length=60,
+    )
     items = discord.ui.TextInput(
         label="Items (one per line)",
         style=discord.TextStyle.paragraph,
@@ -30,9 +40,11 @@ class ItemsModal(discord.ui.Modal, title="Invoice items"):
     notes = discord.ui.TextInput(label="Notes (optional)", style=discord.TextStyle.paragraph,
                                  required=False, max_length=500)
 
-    def __init__(self, cog, opts: dict):
+    def __init__(self, cog, opts: dict, company: str = ""):
         super().__init__()
         self.cog, self.opts = cog, opts
+        if company:
+            self.company.default = company
         self.discount.default = f"{opts['discount_cents'] / 100:g}"
         self.tax.default = f"{opts['tax_percent']:g}" if opts["tax_percent"] else ""
 
@@ -41,8 +53,10 @@ class ItemsModal(discord.ui.Modal, title="Invoice items"):
             return await ui.say(interaction, "🚫 Ticket staff only.")
         bot = self.cog.bot
         try:
+            company = require_company(self.company.value)
             items = parse_items(self.items.value)
             opts = dict(self.opts)
+            opts["company_id"] = company.key
             opts["discount_cents"] = to_cents(self.discount.value or "0")
             try:
                 opts["tax_percent"] = float((self.tax.value or "0").replace("%", "").strip())
@@ -52,6 +66,10 @@ class ItemsModal(discord.ui.Modal, title="Invoice items"):
                 raise ValueError("Discount cannot be negative.")
             if not 0 <= opts["tax_percent"] <= 100:
                 raise ValueError("Tax % must be between 0 and 100.")
+            if duplicate_submission((interaction.user.id, "itemised-invoice", company.key,
+                                     self.items.value.strip().lower()), window=15):
+                raise ValueError("That invoice form was just submitted. Check the invoice channel before "
+                                 "creating it again.")
             default_product = opts.pop("product", None)
             if default_product:
                 for item in items:
@@ -88,43 +106,60 @@ class Invoices(commands.GroupCog, group_name="invoice", group_description="Creat
         return await staff_interaction_check(interaction)
 
     # ---------- reusable invoice drafts (called by ticket and sales panels) ----------
-    def _draft_opts(self, *, client_id, client_name, ticket_channel_id, product=None) -> dict:
+    def _draft_opts(self, *, client_id, client_name, ticket_channel_id, product=None, company=None) -> dict:
         return dict(client_discord_id=client_id, client_name=(client_name or "Client")[:100],
                     client_contact="", due_days=7, tax_percent=0.0, discount_cents=0,
                     category="Hosting Revenue", ticket_channel_id=ticket_channel_id,
-                    product=product)
+                    company_id=company or None, product=product)
 
     async def open_draft_for_ticket(self, interaction: discord.Interaction, ticket: dict):
         if not is_ticket_staff(interaction.user):
             return await ui.say(interaction, "🚫 Ticket staff only.")
         opts = self._draft_opts(client_id=ticket.get("client_discord_id"),
                                 client_name=ticket.get("client_name") or "Client",
-                                ticket_channel_id=ticket.get("channel_id"))
-        await interaction.response.send_modal(ItemsModal(self, opts))
+                                ticket_channel_id=ticket.get("channel_id"),
+                                company=ticket.get("company_id"))
+        # A ticket's company is preselected; staff can change it in the form before saving.
+        await interaction.response.send_modal(
+            ItemsModal(self, opts, company=config.company_name(ticket.get("company_id"))
+                       if config.get_company(ticket.get("company_id")) else ""))
 
     async def open_draft_for_deal(self, interaction: discord.Interaction, deal: dict):
         if not is_ticket_staff(interaction.user):
             return await ui.say(interaction, "🚫 Sales staff only.")
+        company = deal.get("company_id")
+        if config.get_company(company) is None and deal.get("ticket_id"):
+            ticket = await self.bot.db.get_ticket(deal["ticket_id"])
+            company = (ticket or {}).get("company_id")
         opts = self._draft_opts(client_id=deal.get("client_discord_id"),
                                 client_name=deal.get("client_name") or "Client",
                                 ticket_channel_id=deal.get("ticket_channel_id"),
+                                company=company,
                                 product=deal.get("service"))
-        await interaction.response.send_modal(ItemsModal(self, opts))
+        await interaction.response.send_modal(
+            ItemsModal(self, opts, company=config.company_name(company)
+                       if config.get_company(company) else ""))
 
     # ---------- create ----------
-    @app_commands.command(name="create", description="Create an invoice quickly (client, amount, service, due date)")
-    async def create(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(QuickInvoiceModal())
+    @app_commands.command(name="create",
+                          description="Create an invoice quickly (client, amount, service, due date)")
+    @app_commands.describe(company="Company this invoice belongs to")
+    @app_commands.choices(company=company_choices())
+    async def create(self, interaction: discord.Interaction, company: app_commands.Choice[str]):
+        await interaction.response.send_modal(QuickInvoiceModal(company.value))
 
     @app_commands.command(name="create-detailed",
                           description="Create an itemised PDF invoice (items are entered in the next form)")
     @app_commands.describe(client_name="Name printed on the invoice", client="Discord user being billed",
                            due_days="Days until due", tax_percent="Tax rate in %", discount="Flat discount amount",
                            contact="Client phone/email shown on the invoice", category="Income category",
+                           company="Company this invoice belongs to",
                            ticket="Ticket channel/thread to send it to",
                            product="Default digital product type for items without type=...")
-    @app_commands.choices(product=[app_commands.Choice(name=p, value=p) for p in PRODUCT_TYPES])
+    @app_commands.choices(product=[app_commands.Choice(name=p, value=p) for p in PRODUCT_TYPES],
+                          company=company_choices())
     async def create_detailed(self, interaction: discord.Interaction, client_name: str,
+                     company: app_commands.Choice[str],
                      client: Optional[discord.Member] = None,
                      due_days: app_commands.Range[int, 0, 365] = 14,
                      tax_percent: app_commands.Range[float, 0.0, 100.0] = 0.0,
@@ -141,8 +176,10 @@ class Invoices(commands.GroupCog, group_name="invoice", group_description="Creat
                     client_contact=(contact or "")[:80],
                     due_days=due_days, tax_percent=tax_percent, discount_cents=to_cents(discount),
                     category=category, ticket_channel_id=ticket.id if ticket else None,
+                    company_id=company.value,
                     product=product.value if product else None)
-        await interaction.response.send_modal(ItemsModal(self, opts))
+        await interaction.response.send_modal(
+            ItemsModal(self, opts, company=config.company_name(company.value)))
 
     @create_detailed.autocomplete("category")
     async def _cat_ac(self, interaction: discord.Interaction, current: str):
@@ -167,24 +204,27 @@ class Invoices(commands.GroupCog, group_name="invoice", group_description="Creat
         await _pdf_message(interaction.followup, inv, ephemeral=True)
 
     @app_commands.command(name="list", description="List invoices (quick and itemised; filter by status or month)")
-    @app_commands.choices(status=BOTH_STATUS)
+    @app_commands.choices(status=BOTH_STATUS, company=company_choices())
     async def list_cmd(self, interaction: discord.Interaction, status: Optional[app_commands.Choice[str]] = None,
-                       month: Optional[str] = None):
+                       month: Optional[str] = None, company: Optional[app_commands.Choice[str]] = None):
         try:
             month = valid_month(month) if month else None
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
         wanted = status.value if status else None
-        rows = await self.bot.db.list_invoices(wanted, month, limit=20)
+        company_id = company.value if company else None
+        rows = await self.bot.db.list_invoices(wanted, month, limit=20, company_id=company_id)
         lines = []
         for i in rows:
             label = STATUS_STYLE[i["status"]][0].split(" ", 1)[0]
             extra = " · partial" if i["is_partial"] and i["status"] == "overdue" else ""
             delivered = " · 🔗 delivered" if i.get("delivered_at") else ""
-            lines.append(f"{label} **{i['number']}** · {i['client_name'][:25]} · {fmt(i['total'], i['currency'])} "
+            lines.append(f"{label} **{i['number']}** · {config.company_name(i.get('company_id'))} · "
+                         f"{i['client_name'][:25]} · {fmt(i['total'], i['currency'])} "
                          f"(due {fmt(i['balance'], i['currency'])}) · due {dmy(i['due_date'])}{extra}{delivered}")
         quick = [q for q in store.invoices()
                  if (not wanted or wanted == q.get("status"))
+                 and (not company_id or q.get("company") == company_id)
                  and (not month or str(q.get("created_at", ""))[:7] == month)]
         quick_lines = [ui.quick_invoice_line(q) for q in quick[-20:][::-1]]
         if not lines and not quick_lines:

@@ -213,7 +213,9 @@ def _meta_block(inv):
     if inv["status"] == "overdue" and inv["is_partial"]:
         label = "OVERDUE (PARTIAL)"
     terms_days = (dt.date.fromisoformat(inv["due_date"]) - dt.date.fromisoformat(inv["issue_date"])).days
-    rows = [("Invoice No.", f"#{inv['number']}"), ("Invoice Date", _date(inv["issue_date"])),
+    rows = [("Invoice No.", f"#{inv['number']}"),
+            ("Company", config.company_name(inv.get("company_id"))),
+            ("Invoice Date", _date(inv["issue_date"])),
             ("Due Date", _date(inv["due_date"])),
             ("Payment Terms", f"Net {terms_days} days" if terms_days > 0 else "Due on receipt")]
     data = [[P(a, S_SMALL), P(b, _st("mv", fontName=FB, alignment=2))] for a, b in rows]
@@ -413,4 +415,7 @@ def pnl_pdf(report: dict) -> bytes:
              section("Expenses", report["expenses"], "Total expenses", report["expense_total"]), Spacer(1, 12), net_t]
     if report["revenue"]:
         story += [Spacer(1, 6), P(f"Net margin: {net / report['revenue'] * 100:.1f}%", S_SMALL)]
+    if report.get("investment"):
+        story += [Spacer(1, 4), P("Investment contributions are recorded separately and are not part "
+                                  f"of revenue or profit: {money(report['investment'], cur)}.", S_SMALL)]
     return _build(story, page, page, H - 82, f"Profit and Loss {report['month']}")

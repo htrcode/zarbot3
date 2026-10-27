@@ -1,9 +1,9 @@
 """Quick invoices (client, contact, amount, service/plan, due date).
 
-``/invoice create`` opens :class:`QuickInvoiceModal`; the command itself lives in
-``desk/invoices.py`` next to the itemised-invoice commands because Discord allows
-only one ``/invoice`` group. New invoices are posted to ``INVOICE_CHANNEL_ID`` —
-deliberately *not* the channel used for Sales / Expense Statements.
+``/invoice create`` opens :class:`QuickInvoiceModal` and requires a company, so
+the invoice is stored against that company and posted only to its channel. The
+command itself lives in ``desk/invoices.py`` next to the itemised-invoice
+commands because Discord allows only one ``/invoice`` group.
 """
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from discord.ext import commands
 import config
 import data as store
 import ui
+from desk.utils import duplicate_submission
 
 
-class QuickInvoiceModal(discord.ui.Modal, title="Create invoice"):
+class QuickInvoiceModal(discord.ui.Modal):
     customer = discord.ui.TextInput(label="Client name", placeholder="Acme Ltd.", max_length=100)
     contact = discord.ui.TextInput(
         label="Client contact", placeholder="Discord / phone / email", required=False, max_length=100
@@ -29,7 +30,25 @@ class QuickInvoiceModal(discord.ui.Modal, title="Create invoice"):
         label="Due date (YYYY-MM-DD)", placeholder="2026-11-30", required=False, max_length=32
     )
 
+    def __init__(self, company: str = "") -> None:
+        super().__init__()
+        self.company = company
+        if config.get_company(company):
+            self.title = f"New invoice · {config.company_name(company)}"
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        company = config.get_company(self.company)
+        if company is None:
+            await interaction.response.send_message(
+                view=ui.notice(
+                    "No company selected",
+                    "Use `/invoice create company:...` so the invoice is stored under the right company. "
+                    "Nothing is saved until a company is chosen.",
+                    error=True,
+                ),
+                ephemeral=True,
+            )
+            return
         raw_amount = str(self.amount.value).replace(",", "").replace("₹", "").strip()
         try:
             amount = round(float(raw_amount), 2)
@@ -45,13 +64,24 @@ class QuickInvoiceModal(discord.ui.Modal, title="Create invoice"):
                 ephemeral=True,
             )
             return
+        if duplicate_submission((interaction.user.id, "quick-invoice", company.key, amount,
+                                 str(self.customer.value).strip().lower())):
+            await interaction.response.send_message(
+                view=ui.notice(
+                    "Already submitted",
+                    "That invoice was just created. Check the company's invoice channel before adding it again.",
+                    error=True,
+                ),
+                ephemeral=True,
+            )
+            return
 
-        # NEW INVOICES GO TO THE INVOICE CHANNEL, NOT THE STATEMENTS CHANNEL.
-        # Check the channel first so no invoice is saved without being posted.
-        channel = await ui.resolve_channel(interaction.client, config.INVOICE_CHANNEL_ID)
+        # THE COMPANY'S INVOICE CHANNEL ONLY. Check it first so no invoice is
+        # saved without being posted.
+        channel = await ui.resolve_channel(interaction.client, company.channel_id("invoice"))
         if channel is None:
             await interaction.response.send_message(
-                view=ui.missing_channel_notice("INVOICE_CHANNEL_ID"), ephemeral=True
+                view=ui.missing_company_channel_notice(company, "invoice"), ephemeral=True
             )
             return
 
@@ -62,6 +92,7 @@ class QuickInvoiceModal(discord.ui.Modal, title="Create invoice"):
             due=str(self.due.value or ""),
             service=str(self.service.value or ""),
             created_by=interaction.user.display_name,
+            company=company.key,
         )
 
         try:
@@ -70,8 +101,8 @@ class QuickInvoiceModal(discord.ui.Modal, title="Create invoice"):
             await interaction.response.send_message(
                 view=ui.notice(
                     "Could not post invoice",
-                    "I could not send the invoice to the invoice channel — "
-                    "check my **Send Messages** permission there.",
+                    f"`{inv['number']}` was saved for **{company.name}**, but I could not send it to "
+                    f"<#{channel.id}> — check my **Send Messages** permission there.",
                     error=True,
                 ),
                 ephemeral=True,
@@ -82,7 +113,7 @@ class QuickInvoiceModal(discord.ui.Modal, title="Create invoice"):
             view=ui.notice(
                 "Invoice created",
                 f"`{inv['number']}` for **{store.money(inv['amount'])}** ({inv['customer']}) "
-                f"was posted to <#{config.INVOICE_CHANNEL_ID}>.",
+                f"was posted to <#{channel.id}> as **{company.name}**.",
             ),
             ephemeral=True,
         )

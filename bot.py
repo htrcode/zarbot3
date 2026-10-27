@@ -240,6 +240,10 @@ class InvoiceBot(commands.Bot):
             log.warning("INVOICE_CHANNEL_ID is not set — new invoices have nowhere to go.")
         if config.STATEMENTS_CHANNEL_ID is None:
             log.warning("STATEMENTS_CHANNEL_ID is not set — Sales / Expense Statements have nowhere to go.")
+        for company in config.COMPANIES.values():
+            if not company.statement_channel_id:
+                log.warning("%s is not set — %s cannot record sales, expenses, revenue or invoices until "
+                            "that company has a statement channel.", company.statement_env, company.name)
         if not config.TICKET_STAFF_ROLE_IDS:
             log.warning("STAFF_ROLE_IDS / TICKET_STAFF_ROLE_IDS are empty: only administrators can use staff commands.")
         if not config.SALES_CHANNEL_ID:

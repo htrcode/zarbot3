@@ -13,8 +13,8 @@ from discord.ext import commands, tasks
 import config
 import ui
 from desk.database import ticket_number
-from desk.utils import (TICKET_KINDS, TICKET_PRIORITIES, days_since, fmt, is_ticket_staff,
-                   safe_channel_name, staff_interaction_check, to_cents)
+from desk.utils import (TICKET_KINDS, TICKET_PRIORITIES, company_choices, days_since, fmt,
+                   is_ticket_staff, safe_channel_name, staff_interaction_check, to_cents)
 from desk.views import TicketOpenPanelView, build_ticket_view, simple_card
 
 log = logging.getLogger("invoice-bot.tickets")
@@ -223,7 +223,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
     async def open_ticket(self, interaction: discord.Interaction, *, client: Optional[discord.Member],
                           kind: str = "purchase", subject: str = "", details: str = "",
                           service: str = "", budget: int = 0, parent_id: Optional[int] = None,
-                          priority: str = "normal") -> Optional[int]:
+                          priority: str = "normal", company_id: Optional[str] = None) -> Optional[int]:
         """Create the channel, the ticket row and the panel. Used by commands and panels."""
         guild = interaction.guild
         if guild is None:
@@ -291,7 +291,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 interaction.user.id, subject=subject, kind=kind, priority=priority,
                 client_discord_id=client.id, client_name=client.display_name,
                 channel_id=channel.id, parent_ticket_id=parent["id"] if parent else None,
-                budget=budget, service=service[:120], note=details,
+                budget=budget, service=service[:120], note=details, company_id=company_id,
             )
         except discord.HTTPException as e:
             if channel:
@@ -642,16 +642,20 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
     # ------------------------------------------------------------------ commands
     @app_commands.command(name="open", description="Open a numbered ticket channel for a client")
+    @app_commands.describe(company="Financial company for this ticket (invoices preselect it)")
     @app_commands.choices(kind=[app_commands.Choice(name=k.title(), value=k) for k in TICKET_KINDS],
-                          priority=[app_commands.Choice(name=p.title(), value=p) for p in TICKET_PRIORITIES])
+                          priority=[app_commands.Choice(name=p.title(), value=p) for p in TICKET_PRIORITIES],
+                          company=company_choices())
     async def open_cmd(self, interaction: discord.Interaction, client: discord.Member, subject: str,
                        kind: str = "purchase", priority: str = "normal",
                        budget: app_commands.Range[float, 0.0, 100_000_000.0] = 0.0,
                        service: Optional[str] = None, details: Optional[str] = None,
-                       parent: Optional[int] = None):
+                       parent: Optional[int] = None,
+                       company: Optional[app_commands.Choice[str]] = None):
         await self.open_ticket(
             interaction, client=client, kind=kind, subject=subject, details=details or "",
             service=service or "", budget=to_cents(budget), parent_id=parent, priority=priority,
+            company_id=company.value if company else None,
         )
 
     @app_commands.command(name="panel", description="Post the public ticket-opening panel")
@@ -741,6 +745,22 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
         await ui.say(interaction, f"✅ **{ticket_number(row['id'])}** is now **{priority.value}**.")
+
+    @app_commands.command(name="company", description="Set (or change) a ticket's financial company")
+    @app_commands.describe(company="Company this ticket's sales, expenses and invoices belong to")
+    @app_commands.choices(company=company_choices())
+    async def company_cmd(self, interaction: discord.Interaction, company: app_commands.Choice[str],
+                          ticket: Optional[int] = None):
+        try:
+            row = await self._resolve(interaction, ticket)
+            if config.get_company(company.value) is None:
+                raise ValueError("Unknown company.")
+            await self.bot.db.set_ticket_company(interaction.user.id, row["id"], company.value)
+        except ValueError as e:
+            return await ui.say(interaction, f"❌ {e}")
+        await ui.say(interaction, f"✅ {ticket_number(row['id'])} is now filed under "
+                                  f"**{config.company_name(company.value)}**.\n"
+                                  f"-# Moving the ticket between categories does not change this.")
 
     @app_commands.command(name="close", description="Close a ticket, lock the channel and save a transcript")
     async def close_cmd(self, interaction: discord.Interaction, ticket: Optional[int] = None,

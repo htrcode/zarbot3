@@ -120,6 +120,17 @@ def missing_channel_notice(which: str) -> StatusView:
     )
 
 
+def missing_company_channel_notice(company: config.Company, kind: str = "statement") -> StatusView:
+    """Per-company channel that is either unset or not reachable by the bot."""
+    which = company.statement_env if kind == "statement" else company.invoice_env
+    return notice(
+        f"{company.name} channel not available",
+        f"Set `{which}` to a channel id in a server I am in, and give me "
+        "**View Channel** + **Send Messages** there, then try again.",
+        error=True,
+    )
+
+
 _ERROR_ICONS = ("❌", "🚫", "⚠️", "⚠")
 
 
@@ -287,6 +298,7 @@ def sale_card(sale: Dict[str, Any], total_sales: float) -> PersistentView:
     """Sales Statement for one payment received, with the running total."""
     body = "\n".join(
         [
+            _field("Company", config.company_name(sale.get("company"))),
             _field("Date", store.pretty_date(store._entry_date(sale))),
             _field("Client Name", _val(sale.get("client_name") or sale.get("customer"))),
             _field("Client Contact", _val(sale.get("client_contact"))),
@@ -309,7 +321,7 @@ def sale_card(sale: Dict[str, Any], total_sales: float) -> PersistentView:
 
 
 def sales_statement_card(
-    payments: Sequence[Dict[str, Any]], period: str, total: float
+    payments: Sequence[Dict[str, Any]], period: str, total: float, company: str = ""
 ) -> PersistentView:
     """Sales Statement covering a period (one compact line per sale)."""
     lines = _fit(
@@ -322,7 +334,7 @@ def sales_statement_card(
             for p in payments
         ]
     )
-    body = _field("Period", store.PERIODS.get(period, period))
+    body = (_field("Company", company) + "\n" if company else "") + _field("Period", store.PERIODS.get(period, period))
     body += "\n\n" + ("\n".join(lines) if lines else "_No sales recorded in this period._")
     items = title_and_body("Sales Statement", body)
     items.append(discord.ui.Separator())
@@ -338,6 +350,7 @@ def expense_card(expense: Dict[str, Any], total_expenses: float) -> PersistentVi
     """Expense Statement for one expense, with the running total."""
     body = "\n".join(
         [
+            _field("Company", config.company_name(expense.get("company"))),
             _field("Date", store.pretty_date(str(expense.get("date", "")))),
             _field("Expense Description", _val(expense.get("description"))),
             _field("Category", _val(expense.get("category"))),
@@ -361,7 +374,7 @@ def expense_card(expense: Dict[str, Any], total_expenses: float) -> PersistentVi
 
 
 def expenses_statement_card(
-    expenses: Sequence[Dict[str, Any]], period: str, total: float
+    expenses: Sequence[Dict[str, Any]], period: str, total: float, company: str = ""
 ) -> PersistentView:
     """Expense Statement covering a period (one compact line per expense)."""
     lines = _fit(
@@ -373,7 +386,7 @@ def expenses_statement_card(
             for e in expenses
         ]
     )
-    body = _field("Period", store.PERIODS.get(period, period))
+    body = (_field("Company", company) + "\n" if company else "") + _field("Period", store.PERIODS.get(period, period))
     body += "\n\n" + ("\n".join(lines) if lines else "_No expenses recorded in this period._")
     items = title_and_body("Expense Statement", body)
     items.append(discord.ui.Separator())
@@ -394,6 +407,7 @@ def invoice_card(inv: Dict[str, Any]) -> PersistentView:
 
     body = "\n".join(
         [
+            _field("Company", config.company_name(inv.get("company"))),
             _field("Client Name", _val(inv.get("customer"))),
             _field("Client Contact", _val(inv.get("contact"))),
             _field("Service/Plan", _val(inv.get("service") or inv.get("description"))),
@@ -425,6 +439,24 @@ def quick_invoice_line(inv: Dict[str, Any]) -> str:
     return (f"{'✅' if inv.get('status') == 'paid' else '⏳'} **{inv['number']}** · "
             f"{_val(inv.get('customer'))} · {store.money(inv['amount'])} ({state})"
             f" · due {_val(inv.get('due'))}")
+
+
+def revenue_card(revenue: Dict[str, Any]) -> PersistentView:
+    """Revenue Statement for one entry (posted only to that company's channel)."""
+    body = "\n".join(
+        [
+            _field("Transaction ID", revenue.get("number") or f"REV-{int(revenue['id']):04d}"),
+            _field("Company", config.company_name(revenue.get("company_id"))),
+            _field("Category", _val(revenue.get("category"))),
+            _field("Amount", store.money(revenue["amount"] / 100)),
+            _field("Description", _val(revenue.get("description"))),
+            _field("Date", store.pretty_date(str(revenue.get("occurred_on", "")))),
+            _field("Recorded By", _val(revenue.get("recorded_by"))),
+        ]
+    )
+    items = title_and_body("Revenue Statement", body)
+    footer_items(items, f"Recorded {_when(revenue.get('created_at'))}")
+    return _single(PersistentView(timeout=None), items)
 
 
 def invoice_list_card(invoices: Sequence[Dict[str, Any]]) -> PersistentView:
@@ -460,16 +492,30 @@ class MarkPaidModal(discord.ui.Modal, title="Mark invoice as paid"):
         label="Remarks", style=discord.TextStyle.paragraph, required=False, max_length=300
     )
 
-    def __init__(self, number: str) -> None:
+    def __init__(self, number: str, company: str = "") -> None:
         super().__init__()
         self.number = number
+        self.company = company
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Check the statements channel first so a sale is never saved unannounced.
-        channel = await resolve_channel(interaction.client, config.STATEMENTS_CHANNEL_ID)
+        stored = (store.invoice(self.number) or {}).get("company", "")
+        company = config.get_company(self.company or stored)
+        if company is None:
+            await interaction.response.send_message(
+                view=notice(
+                    "No company assigned",
+                    f"Invoice `{self.number}` has no company yet. Use `/invoice create` with a company, "
+                    "or re-record the sale with `/sale add company:...`.",
+                    error=True,
+                ),
+                ephemeral=True,
+            )
+            return
+        # Check the company's statement channel first so a sale is never saved unannounced.
+        channel = await resolve_channel(interaction.client, company.channel_id("statement"))
         if channel is None:
             await interaction.response.send_message(
-                view=missing_channel_notice("STATEMENTS_CHANNEL_ID"), ephemeral=True
+                view=missing_company_channel_notice(company), ephemeral=True
             )
             return
 
@@ -481,6 +527,7 @@ class MarkPaidModal(discord.ui.Modal, title="Mark invoice as paid"):
             server_uuid=str(self.server_uuid.value or ""),
             remarks=str(self.remarks.value or ""),
             paid_by=interaction.user.display_name,
+            company=company.key,
         )
         if result is None:
             await interaction.response.send_message(
@@ -501,19 +548,47 @@ class MarkPaidModal(discord.ui.Modal, title="Mark invoice as paid"):
         except Exception:
             log.exception("Could not mirror the sale into the finance books")
 
-        # 2) the Sales Statement goes to the statements channel, never the invoice channel
+        # 2) the Sales Statement goes to that company's channel, never another company's
         try:
-            await channel.send(view=sale_card(sale, store.total_sales()))
+            await channel.send(view=sale_card(sale, store.total_sales(company=company.key)))
         except discord.HTTPException:
             await interaction.followup.send(
                 view=notice(
                     "Could not post sales statement",
-                    "The invoice is marked paid, but I could not post to the statements "
-                    "channel — check my **Send Messages** permission there.",
+                    f"The invoice is marked paid, but I could not post to <#{channel.id}> "
+                    f"for **{company.name}** — check my **Send Messages** permission there.",
                     error=True,
                 ),
                 ephemeral=True,
             )
+
+
+def _open_paid_modal(number: str, company_key: str):
+    async def callback(interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(MarkPaidModal(number, company_key))
+
+    return callback
+
+
+def company_picker(number: str, title: str = "Pick a company") -> PersistentView:
+    """Ephemeral card whose buttons open 'mark as paid' for the chosen company.
+
+    Used for older invoices that were saved before multi-company support, so the
+    company is never guessed.
+    """
+    row = discord.ui.ActionRow()
+    for company in config.COMPANIES.values():
+        button = discord.ui.Button(label=company.name, style=discord.ButtonStyle.secondary)
+        button.callback = _open_paid_modal(number, company.key)
+        row.add_item(button)
+    view = PersistentView(timeout=180)
+    view.add_item(discord.ui.Container(*card_items(
+        title,
+        f"Invoice `{number}` predates multi-company support, so it has no company yet. "
+        "Pick the company this payment belongs to.",
+        rows=[row],
+    )))
+    return view
 
 
 class MarkPaidButton(
@@ -563,4 +638,7 @@ class MarkPaidButton(
                 ephemeral=True,
             )
             return
-        await interaction.response.send_modal(MarkPaidModal(self.number))
+        if config.get_company(inv.get("company")) is None:
+            await interaction.response.send_message(view=company_picker(self.number), ephemeral=True)
+            return
+        await interaction.response.send_modal(MarkPaidModal(self.number, inv["company"]))

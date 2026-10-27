@@ -18,8 +18,9 @@ Do not commit your real token to a public repository.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -34,6 +35,26 @@ GUILD_ID = ""
 
 INVOICE_CHANNEL_ID = 0  # channel id where new invoices are posted
 STATEMENTS_CHANNEL_ID = 0  # channel id for Sales / Expense Statements
+
+# --- Companies (multi-company finance) ---------------------------------------
+# Every sale, expense, revenue entry and invoice is stored against one of these
+# three companies (key -> name), and its statement is posted only to that
+# company's own channel. A company channel may live in another server; the bot
+# must be a member there with View Channel + Send Messages.
+#
+# Fill in the channel ids here, or as panel / environment variables:
+#   COMPANY_ZARBUNEX_STATEMENT_CHANNEL_ID, COMPANY_HECTORHOST_STATEMENT_CHANNEL_ID,
+#   COMPANY_MATRIXMC_STATEMENT_CHANNEL_ID
+#   COMPANY_ZARBUNEX_INVOICE_CHANNEL_ID, ... (optional: invoice cards; defaults
+#   to the same company's statement channel)
+#   COMPANY_ZARBUNEX_NAME, ... (optional display-name override)
+# Leave an id at 0 until you have the real channel: the commands then refuse to
+# save instead of posting one company's money into another company's channel.
+COMPANY_CONFIG = {
+    "zarbunex": {"name": "Zarbunex PVT LTD", "statement_channel_id": 0, "invoice_channel_id": 0},
+    "hectorhost": {"name": "HectorHost", "statement_channel_id": 0, "invoice_channel_id": 0},
+    "matrixmc": {"name": "MatrixMC", "statement_channel_id": 0, "invoice_channel_id": 0},
+}
 
 # Roles allowed to use the finance / invoice / ticket / sales commands
 # (server administrators always can). Role ids separated by commas: "111,222"
@@ -221,3 +242,61 @@ BRAND_COLOR: str = _text("BRAND_COLOR", BRAND_COLOR)
 INVOICE_PREFIX: str = _text("INVOICE_PREFIX", INVOICE_PREFIX)
 SIGNATURE_PATH: str = _path(_env("SIGNATURE_PATH"), "assets/signature.png", "signature.png")
 LOGO_PATH: str = _path(_env("LOGO_PATH"), "assets/logo.png", "logo.png")
+
+# ---- companies ------------------------------------------------------------
+@dataclass(frozen=True)
+class Company:
+    """One of the configured companies: a stable key, a display name and its channels."""
+
+    key: str
+    name: str
+    statement_channel_id: Optional[int] = None
+    invoice_channel_id: Optional[int] = None
+
+    @property
+    def statement_env(self) -> str:
+        return f"COMPANY_{self.key.upper()}_STATEMENT_CHANNEL_ID"
+
+    @property
+    def invoice_env(self) -> str:
+        return f"COMPANY_{self.key.upper()}_INVOICE_CHANNEL_ID"
+
+    def channel_id(self, kind: str = "statement") -> Optional[int]:
+        """Statement channel, or the invoice channel (which falls back to the statement channel)."""
+        if kind == "invoice":
+            return self.invoice_channel_id or self.statement_channel_id
+        return self.statement_channel_id
+
+
+COMPANIES: Dict[str, Company] = {
+    key: Company(
+        key=key,
+        name=_text(f"COMPANY_{key.upper()}_NAME", cfg.get("name", key)),
+        statement_channel_id=_one(f"COMPANY_{key.upper()}_STATEMENT_CHANNEL_ID",
+                                  cfg.get("statement_channel_id", 0)),
+        invoice_channel_id=_one(f"COMPANY_{key.upper()}_INVOICE_CHANNEL_ID",
+                                cfg.get("invoice_channel_id", 0)),
+    )
+    for key, cfg in COMPANY_CONFIG.items()
+}
+
+
+def get_company(value) -> Optional[Company]:
+    """Company by key (``hectorhost``) or display name (``HectorHost``); None if unknown/empty."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.lower() in COMPANIES:
+        return COMPANIES[text.lower()]
+    for company in COMPANIES.values():
+        if company.name.casefold() == text.casefold():
+            return company
+    return None
+
+
+def company_name(value) -> str:
+    """Display name for a stored company key (``—`` when unset, so old rows stay readable)."""
+    company = get_company(value)
+    if company:
+        return company.name
+    return str(value).strip() if value else "—"
