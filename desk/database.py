@@ -95,6 +95,33 @@ CREATE TABLE IF NOT EXISTS revenue (
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS giveaways (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    channel_id INTEGER,
+    message_id INTEGER,
+    prize TEXT NOT NULL,
+    winners INTEGER NOT NULL DEFAULT 1,
+    required_role_id INTEGER,
+    host_id INTEGER NOT NULL,
+    ends_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','ended')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT
+);
+CREATE TABLE IF NOT EXISTS giveaway_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    giveaway_id INTEGER NOT NULL REFERENCES giveaways(id),
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(giveaway_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS giveaway_winners (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    giveaway_id INTEGER NOT NULL REFERENCES giveaways(id),
+    user_id INTEGER NOT NULL,
+    picked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -162,6 +189,9 @@ CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(occurred_on);
 CREATE INDEX IF NOT EXISTS idx_tx_company ON transactions(company_id);
 CREATE INDEX IF NOT EXISTS idx_revenue_date ON revenue(occurred_on);
 CREATE INDEX IF NOT EXISTS idx_revenue_company ON revenue(company_id);
+CREATE INDEX IF NOT EXISTS idx_giveaways_status ON giveaways(status);
+CREATE INDEX IF NOT EXISTS idx_giveaway_entries ON giveaway_entries(giveaway_id);
+CREATE INDEX IF NOT EXISTS idx_giveaway_winners ON giveaway_winners(giveaway_id);
 CREATE INDEX IF NOT EXISTS idx_pay_inv ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_channel ON tickets(channel_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
@@ -211,6 +241,10 @@ def ticket_number(ticket_id: int) -> str:
 
 def revenue_number(revenue_id: int) -> str:
     return f"REV-{revenue_id:04d}"
+
+
+def giveaway_number(giveaway_id: int) -> str:
+    return f"GA-{giveaway_id:04d}"
 
 
 def _finish(inv: dict) -> dict:
@@ -1138,6 +1172,90 @@ class Database:
                 "revenue": revenue, "expense_total": spent, "net": revenue - spent,
                 "revenue_rows": [(name, rev.get(name, 0)) for name in REVENUE_CATEGORIES],
                 "revenue_total": sum(rev.values()), "investment": investment}
+
+    # ---------- giveaways ----------
+    async def create_giveaway(self, actor_id, *, guild_id, channel_id, prize, winners, required_role_id,
+                              ends_at):
+        async with self.lock:
+            cur = await self.conn.execute(
+                """INSERT INTO giveaways(guild_id, channel_id, prize, winners, required_role_id,
+                   host_id, ends_at) VALUES (?,?,?,?,?,?,?)""",
+                (guild_id, channel_id, prize[:200], max(int(winners), 1), required_role_id,
+                 actor_id, ends_at),
+            )
+            giveaway_id = cur.lastrowid
+            await self._audit(actor_id, "giveaway.create", "giveaway", giveaway_id,
+                              {"prize": prize, "winners": winners, "ends_at": ends_at,
+                               "role": required_role_id})
+            await self.conn.commit()
+            return giveaway_id
+
+    async def set_giveaway_message(self, giveaway_id, message_id):
+        async with self.lock:
+            await self.conn.execute("UPDATE giveaways SET message_id=? WHERE id=?", (message_id, giveaway_id))
+            await self.conn.commit()
+
+    async def get_giveaway(self, giveaway_id: int):
+        row = await self.fetchone("SELECT * FROM giveaways WHERE id=?", (giveaway_id,))
+        return dict(row) if row else None
+
+    async def open_giveaways(self):
+        return [dict(r) for r in await self.fetchall(
+            "SELECT * FROM giveaways WHERE status='open' ORDER BY ends_at ASC")]
+
+    async def giveaway_entry_count(self, giveaway_id: int) -> int:
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS n FROM giveaway_entries WHERE giveaway_id=?", (giveaway_id,))
+        return row["n"] if row else 0
+
+    async def enter_giveaway(self, giveaway_id: int, user_id: int) -> bool:
+        """Add one entry. False when that member already entered (duplicate guard)."""
+        async with self.lock:
+            try:
+                cur = await self.conn.execute(
+                    "INSERT OR IGNORE INTO giveaway_entries(giveaway_id, user_id) VALUES (?,?)",
+                    (giveaway_id, user_id),
+                )
+            except aiosqlite.IntegrityError:
+                await self.conn.rollback()
+                return False
+            await self.conn.commit()
+            return cur.rowcount == 1
+
+    async def giveaway_entries(self, giveaway_id: int):
+        return [r["user_id"] for r in await self.fetchall(
+            "SELECT user_id FROM giveaway_entries WHERE giveaway_id=? ORDER BY id", (giveaway_id,))]
+
+    async def giveaway_winners(self, giveaway_id: int):
+        return [dict(r) for r in await self.fetchall(
+            "SELECT * FROM giveaway_winners WHERE giveaway_id=? ORDER BY id", (giveaway_id,))]
+
+    async def finish_giveaway(self, actor_id, giveaway_id, winner_ids) -> bool:
+        """Close a giveaway exactly once and record the drawn winners."""
+        async with self.lock:
+            cur = await self.conn.execute(
+                "UPDATE giveaways SET status='ended', ended_at=datetime('now') "
+                "WHERE id=? AND status='open'", (giveaway_id,))
+            if cur.rowcount != 1:
+                await self.conn.rollback()
+                return False
+            for user_id in winner_ids:
+                await self.conn.execute(
+                    "INSERT INTO giveaway_winners(giveaway_id, user_id) VALUES (?,?)",
+                    (giveaway_id, user_id))
+            await self._audit(actor_id, "giveaway.end", "giveaway", giveaway_id,
+                              {"winners": list(winner_ids)})
+            await self.conn.commit()
+        return True
+
+    async def add_giveaway_winner(self, actor_id, giveaway_id, user_id):
+        """Record a rerolled winner on an already-ended giveaway."""
+        async with self.lock:
+            await self.conn.execute(
+                "INSERT INTO giveaway_winners(giveaway_id, user_id) VALUES (?,?)",
+                (giveaway_id, user_id))
+            await self._audit(actor_id, "giveaway.reroll", "giveaway", giveaway_id, {"winner": user_id})
+            await self.conn.commit()
 
     # ---------- audit ----------
     async def recent_audit(self, limit: int = 15):

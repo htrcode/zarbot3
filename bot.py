@@ -88,6 +88,7 @@ EXTENSIONS = (
     "desk.sales",     # /sales ...
     "cogs.finance",   # /sale, /expense, /revenue, /statement (company statements)
     "cogs.embed",     # /embed (announcement cards)
+    "cogs.giveaways",  # /giveaway ... (button entries, auto draw, rerolls)
 )
 
 

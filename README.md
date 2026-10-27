@@ -73,6 +73,17 @@ Purchase / enquiry tickets create deals automatically; invoices move them to Quo
 |---|---|
 | `/embed` | Post a card (`## title`, message body, `-# footer`) in the chosen channel. `channel`, `title` and `footer` are command options; the message itself is typed in a form, where title and footer can still be edited. Staff only, never pings anyone |
 
+**Giveaways** (`/giveaway ...`)
+
+| Command | What it does |
+|---|---|
+| `create` | Post a giveaway card in a channel: prize, winners, duration in minutes, optional required role. The card shows a live entry count and a Discord countdown; the **Enter giveaway** button adds one entry per member |
+| `end` | Draw the winners immediately instead of waiting |
+| `reroll` | Pick a replacement winner after the giveaway ended (never repeats a previous winner) |
+
+Giveaways, entries and winners live in `data/bot.db`, so entries and running giveaways survive a restart;
+the draw happens automatically within ~30 seconds of the end time and pings only the winners.
+
 **Finance** (`/finance ...`): `income`, `expense`, `category-add`, `transactions`, `void`, `audit`, `dashboard`, `pnl`.
 `income`/`expense` require a company; `transactions`, `dashboard` and `pnl` accept an optional company
 (omitted = all companies). The dashboard and P&L list Commission / Investment / General separately;
