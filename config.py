@@ -83,6 +83,25 @@ TICKET_OUTDATED_CLIENTS_CATEGORY_ID = 0  # "Outdated Clients" category
 TICKET_FOLLOWUP_CATEGORY_ID = 0  # "Follow Up" category
 TICKET_CLOSED_CATEGORY_ID = 0  # closed tickets are moved here (optional)
 TICKET_STAFF_ROLE_IDS = ""  # roles that see every ticket (falls back to STAFF_ROLE_IDS)
+
+# --- Department staff roles (one set per ticket category) ------------------
+# Staff with a category's role(s) can see and manage that category's tickets, and
+# access is handed over when a ticket is moved. One id, or several separated by
+# commas: "111,222". Leave "" for a category your team does not split up: then
+# TICKET_STAFF_ROLE_IDS (any ticket staff) cover it, exactly as before.
+TICKET_DEFAULT_STAFF_ROLE_IDS = ""  # "Tickets" (the default category)
+TICKET_BILLING_STAFF_ROLE_IDS = ""  # "Billing"
+TICKET_SUPPORT_STAFF_ROLE_IDS = ""  # "Technical Support"
+TICKET_PARTNERSHIP_STAFF_ROLE_IDS = ""  # "Partnership"
+TICKET_RECRUITMENT_STAFF_ROLE_IDS = ""  # "Recruitment"
+TICKET_ACTIVE_CLIENTS_STAFF_ROLE_IDS = ""  # "Active Clients"
+TICKET_OUTDATED_CLIENTS_STAFF_ROLE_IDS = ""  # "Outdated Clients"
+TICKET_FOLLOWUP_STAFF_ROLE_IDS = ""  # "Follow Up"
+# Roles that may see and manage EVERY ticket whatever its department (managers,
+# supervisors). They are never removed when a ticket moves. Administrators and
+# the ticket owner always keep access too.
+TICKET_CROSS_DEPARTMENT_ROLE_IDS = ""
+
 TICKET_LOG_CHANNEL_ID = 0  # transcripts, close/reopen logs, stale-ticket digest
 TICKET_PREFIX = "ticket"
 TICKET_CLOSED_PREFIX = "closed"
@@ -213,6 +232,27 @@ TICKET_CATEGORIES = {
     "outdated": ("Outdated Clients", "TICKET_OUTDATED_CLIENTS_CATEGORY_ID", TICKET_OUTDATED_CLIENTS_CATEGORY_ID),
     "followup": ("Follow Up", "TICKET_FOLLOWUP_CATEGORY_ID", TICKET_FOLLOWUP_CATEGORY_ID),
 }
+#: Ticket category key -> the variable that lists that department's staff roles.
+TICKET_DEPARTMENT_ROLE_ENV: Dict[str, str] = {
+    "tickets": "TICKET_DEFAULT_STAFF_ROLE_IDS",
+    "billing": "TICKET_BILLING_STAFF_ROLE_IDS",
+    "support": "TICKET_SUPPORT_STAFF_ROLE_IDS",
+    "partnership": "TICKET_PARTNERSHIP_STAFF_ROLE_IDS",
+    "recruitment": "TICKET_RECRUITMENT_STAFF_ROLE_IDS",
+    "active": "TICKET_ACTIVE_CLIENTS_STAFF_ROLE_IDS",
+    "outdated": "TICKET_OUTDATED_CLIENTS_STAFF_ROLE_IDS",
+    "followup": "TICKET_FOLLOWUP_STAFF_ROLE_IDS",
+}
+#: Roles that may manage every ticket, whatever its department (never removed on a move).
+TICKET_CROSS_DEPARTMENT_ROLE_IDS: List[int] = _ids("TICKET_CROSS_DEPARTMENT_ROLE_IDS",
+                                                   TICKET_CROSS_DEPARTMENT_ROLE_IDS)
+#: Department staff role ids per category key (parsed once, at import).
+TICKET_DEPARTMENT_ROLE_IDS: Dict[str, List[int]] = {
+    key: _ids(var, globals().get(var, "")) for key, var in TICKET_DEPARTMENT_ROLE_ENV.items()
+}
+#: Every role used by any department (used to clean up access when a ticket moves).
+ALL_DEPARTMENT_ROLE_IDS: List[int] = sorted({rid for ids in TICKET_DEPARTMENT_ROLE_IDS.values()
+                                             for rid in ids})
 TICKET_STAFF_ROLE_IDS: List[int] = _ids("TICKET_STAFF_ROLE_IDS", TICKET_STAFF_ROLE_IDS) or STAFF_ROLE_IDS
 TICKET_LOG_CHANNEL_ID: Optional[int] = _one("TICKET_LOG_CHANNEL_ID", TICKET_LOG_CHANNEL_ID) or LOG_CHANNEL_ID
 TICKET_PREFIX: str = _text("TICKET_PREFIX", TICKET_PREFIX)
@@ -300,3 +340,30 @@ def company_name(value) -> str:
     if company:
         return company.name
     return str(value).strip() if value else "—"
+
+
+# ---- ticket departments ---------------------------------------------------
+def department_roles(key) -> List[int]:
+    """Staff role ids for a ticket category key (empty for an unknown/blank key)."""
+    return list(TICKET_DEPARTMENT_ROLE_IDS.get(str(key or "").strip().lower(), []))
+
+
+def department_role_env(key) -> str:
+    """The variable that configures a ticket category's staff roles."""
+    return TICKET_DEPARTMENT_ROLE_ENV.get(str(key or "").strip().lower(), "TICKET_STAFF_ROLE_IDS")
+
+
+def department_label(key) -> str:
+    """Display label of a ticket category key (``Support`` when it is unknown)."""
+    entry = TICKET_CATEGORIES.get(str(key or "").strip().lower())
+    return entry[0] if entry else "Support"
+
+
+def category_key(category_id) -> Optional[str]:
+    """Key of ``TICKET_CATEGORIES`` for a Discord category id (None when it is not ours)."""
+    if not category_id:
+        return None
+    for key, (_label, _var, cid) in TICKET_CATEGORIES.items():
+        if cid and int(cid) == int(category_id):
+            return key
+    return None

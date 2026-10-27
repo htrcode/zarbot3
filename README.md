@@ -37,6 +37,35 @@ Staff commands need **Administrator** or a role listed in `STAFF_ROLE_IDS`.
 | `SALES_CHANNEL_ID` | follow-up reminders |
 | `TRANSACTION_CHANNEL_IDS` | optional extra copies of invoice / payment cards |
 
+## Ticket departments (staff roles per category)
+
+Every ticket category has its own staff roles, so a department sees and manages only
+its own tickets. Set the ids in `config.py` or as panel variables (comma separated):
+
+| Variable | Category |
+|---|---|
+| `TICKET_DEFAULT_STAFF_ROLE_IDS` | Tickets (the default category) |
+| `TICKET_BILLING_STAFF_ROLE_IDS` | Billing |
+| `TICKET_SUPPORT_STAFF_ROLE_IDS` | Technical Support |
+| `TICKET_PARTNERSHIP_STAFF_ROLE_IDS` | Partnership |
+| `TICKET_RECRUITMENT_STAFF_ROLE_IDS` | Recruitment |
+| `TICKET_ACTIVE_CLIENTS_STAFF_ROLE_IDS` | Active Clients |
+| `TICKET_OUTDATED_CLIENTS_STAFF_ROLE_IDS` | Outdated Clients |
+| `TICKET_FOLLOWUP_STAFF_ROLE_IDS` | Follow Up |
+| `TICKET_STAFF_ROLE_IDS` | every ticket (supervisors) |
+| `TICKET_CROSS_DEPARTMENT_ROLE_IDS` | every ticket, never removed by a move |
+
+Those roles sit alongside the category ids you already set (`TICKET_DEFAULT_CATEGORY_ID`,
+`TICKET_CATEGORY_ID`, `TICKET_SUPPORT_CATEGORY_ID`, `TICKET_PARTNERSHIP_CATEGORY_ID`,
+`TICKET_RECRUITMENT_CATEGORY_ID`, `TICKET_ACTIVE_CLIENTS_CATEGORY_ID`,
+`TICKET_OUTDATED_CLIENTS_CATEGORY_ID`, `TICKET_FOLLOWUP_CATEGORY_ID`, `TICKET_CLOSED_CATEGORY_ID`).
+
+A category left at `""` behaves exactly as before (any `TICKET_STAFF_ROLE_IDS` member can
+manage it). Administrators, the ticket owner and the bot always keep access, and a move
+hands access from the previous department to the destination one. The channel permission
+overwrites are the enforcement point, so an unrelated department cannot even read the
+ticket, and every button/modal re-checks the caller's department on the server side.
+
 ## Commands
 
 **Statements** (all company-scoped: pick `company:` every time)
@@ -45,7 +74,7 @@ Staff commands need **Administrator** or a role listed in `STAFF_ROLE_IDS`.
 |---|---|
 | `/sale add` | Record a sale → posts a **Sales Statement** to that company's channel (Company, Date, Client Name/Contact, Server Name/UUID, Service/Plan, Amount Received, Payment Method, Transaction ID, Remarks, **Total Sales** for that company) |
 | `/expense add` | Record an expense → posts an **Expense Statement** to that company's channel (Company, Date, Description, Category, Amount, Payment Method, Paid To, Transaction ID, Remarks, **Total Expenses** for that company) |
-| `/revenue` | Record revenue (`Commission`, `Investment`, `General`) → posts a **Revenue Statement** (Transaction ID `REV-0001`, Company, Category, Amount, Description, Date, Recorded By) to that company's channel |
+| `/revenue` | Record revenue the same way `/expense add` works: `company`, `category` (`Commission` / `Investment` / `General`), `amount`, `description`, `received_from`, plus optional `method`, `transaction_id`, `remarks`, `date`. Posts a **Revenue Statement** (Transaction ID `REV-0001`, Company, Date, Category, Amount, Received From, Payment Method, Transaction ID / Ref, Description, Remarks, Recorded By, that company's **Total Revenue**) to that company's channel only |
 | `/statement sales`, `/statement expenses` | Per-company period report (today / 7 days / 30 days / all time) with the period total |
 
 **Invoices** (`/invoice ...`)
@@ -60,7 +89,13 @@ Staff commands need **Administrator** or a role listed in `STAFF_ROLE_IDS`.
 Itemised item line: `name | quantity | unit price | type=VPS; server=Hector-VPS-12; node=Ryzen; plan=4GB; id=HX-1122; link=https://...`
 
 **Tickets** (`/ticket ...`): `open`, `panel`, `info`, `list`, `claim`, `assign`, `note`, `priority`, `company`, `close`, `reopen`, `transcript`, `dashboard`.
-Panels have buttons: Claim, Create Invoice, Linked Ticket, Add Note, Transcript, Sales, Close/Reopen.
+Panels have buttons: Claim, Create Invoice, Linked Ticket, Add Note, Transcript, Sales, Close/Reopen and Move.
+The dashboard shows the category, subject, client, status, priority and history — not the ticket type or the
+financial company (companies belong to the invoice / finance flows; `/ticket company` still files a ticket under one).
+**Move** opens one form asking for the **destination category** and a **reason** (the channel name is optional):
+the same channel moves with its messages, history and owner, the reason is saved as a timestamped dashboard note
+(including who moved it) and in the move history, the destination department gains access while the previous one
+loses it, and the dashboard refreshes in place. There is one ticket-movement action — no separate "Complete Purchase".
 `/ticket company` files a ticket under a company; invoices raised from that ticket preselect it, and
 moving the ticket between Discord categories never changes it.
 
@@ -86,8 +121,9 @@ the draw happens automatically within ~30 seconds of the end time and pings only
 
 **Finance** (`/finance ...`): `income`, `expense`, `category-add`, `transactions`, `void`, `audit`, `dashboard`, `pnl`.
 `income`/`expense` require a company; `transactions`, `dashboard` and `pnl` accept an optional company
-(omitted = all companies). The dashboard and P&L list Commission / Investment / General separately;
-Investment is never counted as operating revenue or profit.
+(omitted = all companies). Revenue recorded with `/revenue` belongs to that company's P&L for its own month:
+Operating Revenue is split into the recorded income categories and the `Commission` / `General` revenue
+statement lines, and `Investment` is shown on its own line because capital is never revenue or profit.
 
 ## Companies (multi-company finance)
 

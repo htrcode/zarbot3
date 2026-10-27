@@ -90,6 +90,11 @@ CREATE TABLE IF NOT EXISTS revenue (
     category TEXT NOT NULL CHECK (category IN ('Commission','Investment','General')),
     amount INTEGER NOT NULL CHECK (amount > 0),
     description TEXT,
+    received_from TEXT,
+    method TEXT,
+    transaction_id TEXT,
+    remarks TEXT,
+    recorded_by TEXT,
     occurred_on TEXT NOT NULL,
     voided INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER NOT NULL,
@@ -222,6 +227,8 @@ NEW_COLUMNS = {
     },
     "payments": {"transaction_id": "TEXT", "company_id": "TEXT"},
     "transactions": {"company_id": "TEXT"},
+    "revenue": {"received_from": "TEXT", "method": "TEXT", "transaction_id": "TEXT",
+                "remarks": "TEXT", "recorded_by": "TEXT"},
     "tickets": {"purchase_completed_at": "TEXT", "panel_message_id": "INTEGER",
                 "company_id": "TEXT"},
     "invoice_items": {
@@ -1097,17 +1104,27 @@ class Database:
         return [dict(r) for r in await self.fetchall(sql, params)]
 
     # ---------- revenue statements (Commission / Investment / General) ----------
-    async def add_revenue(self, actor_id, company_id, category, amount, description, occurred_on):
-        """Record a revenue statement entry: unique REV id, company, category, amount, date, staff."""
+    async def add_revenue(self, actor_id, company_id, category, amount, description, occurred_on,
+                          *, received_from="", method="", transaction_id="", remarks="",
+                          recorded_by=""):
+        """Record a revenue statement entry: unique REV id, company, category, amount, date, staff.
+
+        The payment details mirror an expense entry (who sent it, how it was sent,
+        the reference and remarks), so ``/revenue`` captures the same fields as
+        ``/expense add``. They are optional so existing callers keep working.
+        """
         if category not in REVENUE_CATEGORIES:
             raise ValueError("Category must be one of: " + ", ".join(REVENUE_CATEGORIES) + ".")
         if amount <= 0:
             raise ValueError("Amount must be above zero.")
         async with self.lock:
             cur = await self.conn.execute(
-                """INSERT INTO revenue(company_id, category, amount, description, occurred_on, created_by)
-                   VALUES (?,?,?,?,?,?)""",
-                ((company_id or None), category, amount, (description or "")[:200], occurred_on, actor_id),
+                """INSERT INTO revenue(company_id, category, amount, description, received_from, method,
+                   transaction_id, remarks, recorded_by, occurred_on, created_by)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                ((company_id or None), category, amount, (description or "")[:200],
+                 (received_from or "")[:100], (method or "")[:40], (transaction_id or "")[:100],
+                 (remarks or "")[:200], (recorded_by or "")[:100], occurred_on, actor_id),
             )
             await self._audit(actor_id, "revenue.add", "revenue", cur.lastrowid,
                               {"company": company_id, "category": category, "amount": amount,
@@ -1140,6 +1157,23 @@ class Database:
         params.append(limit)
         return [dict(r) for r in await self.fetchall(sql, params)]
 
+    async def revenue_summary(self, company_id: str | None = None) -> dict:
+        """All-time revenue statement totals, split the way the reports need them.
+
+        ``operating`` is Commission + General (real revenue); ``investment`` is
+        capital and is never added to revenue or profit.
+        """
+        sql = "SELECT category, COALESCE(SUM(amount),0) AS total FROM revenue WHERE voided=0"
+        params: list = []
+        if company_id:
+            sql += " AND company_id=?"
+            params.append(company_id)
+        sql += " GROUP BY category"
+        totals = {r["category"]: r["total"] for r in await self.fetchall(sql, params)}
+        return {**{name: totals.get(name, 0) for name in REVENUE_CATEGORIES},
+                "operating": sum(v for k, v in totals.items() if k != "Investment"),
+                "investment": totals.get("Investment", 0)}
+
     async def month_report(self, month: str, company_id: str | None = None) -> dict:
         """Income, expenses and revenue for a month, optionally for one company.
 
@@ -1164,11 +1198,16 @@ class Database:
         expenses = [(r["name"], r["total"]) for r in rows if r["kind"] == "expense"]
         rev = await self.revenue_totals(month, company_id)
         investment = rev.get("Investment", 0)
+        # Everything recorded through /revenue except Investment is operating revenue.
         statement_revenue = sum(v for k, v in rev.items() if k != "Investment")
-        revenue = sum(t for _, t in income) + statement_revenue
+        income_total = sum(t for _, t in income)
+        revenue = income_total + statement_revenue
         spent = sum(t for _, t in expenses)
         return {"month": month, "company": company_id,
-                "income": income, "expenses": expenses,
+                "income": income, "income_total": income_total, "expenses": expenses,
+                "statement_rows": [(name, rev.get(name, 0)) for name in REVENUE_CATEGORIES
+                                   if name != "Investment"],
+                "statement_total": statement_revenue,
                 "revenue": revenue, "expense_total": spent, "net": revenue - spent,
                 "revenue_rows": [(name, rev.get(name, 0)) for name in REVENUE_CATEGORIES],
                 "revenue_total": sum(rev.values()), "investment": investment}

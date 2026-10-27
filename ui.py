@@ -441,20 +441,36 @@ def quick_invoice_line(inv: Dict[str, Any]) -> str:
             f" · due {_val(inv.get('due'))}")
 
 
-def revenue_card(revenue: Dict[str, Any]) -> PersistentView:
-    """Revenue Statement for one entry (posted only to that company's channel)."""
+def revenue_card(revenue: Dict[str, Any], totals: Optional[Dict[str, Any]] = None) -> PersistentView:
+    """Revenue Statement for one entry (posted only to that company's channel).
+
+    Same shape as the Expense Statement, plus ``totals`` (from
+    ``Database.revenue_summary``) shows that company's running Total Revenue.
+    Investment is listed separately because it is not operating revenue.
+    """
     body = "\n".join(
         [
             _field("Transaction ID", revenue.get("number") or f"REV-{int(revenue['id']):04d}"),
             _field("Company", config.company_name(revenue.get("company_id"))),
+            _field("Date", store.pretty_date(str(revenue.get("occurred_on") or revenue.get("date") or ""))),
             _field("Category", _val(revenue.get("category"))),
             _field("Amount", store.money(revenue["amount"] / 100)),
+            _field("Received From", _val(revenue.get("received_from"))),
+            _field("Payment Method", _method(revenue.get("method"))),
+            _field("Transaction ID / Ref", _val(revenue.get("transaction_id"), code=True)),
             _field("Description", _val(revenue.get("description"))),
-            _field("Date", store.pretty_date(str(revenue.get("occurred_on", "")))),
+            _field("Remarks", _val(revenue.get("remarks"))),
             _field("Recorded By", _val(revenue.get("recorded_by"))),
         ]
     )
     items = title_and_body("Revenue Statement", body)
+    if totals is not None:
+        items.append(discord.ui.Separator())
+        items.append(discord.ui.TextDisplay(
+            _field("Total Revenue", store.money((totals.get("operating") or 0) / 100))))
+        if totals.get("investment"):
+            items.append(discord.ui.TextDisplay(_field(
+                "Investment (tracked separately)", store.money(totals["investment"] / 100))))
     footer_items(items, f"Recorded {_when(revenue.get('created_at'))}")
     return _single(PersistentView(timeout=None), items)
 

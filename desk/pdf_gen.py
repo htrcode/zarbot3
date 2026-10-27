@@ -409,9 +409,14 @@ def pnl_pdf(report: dict) -> bytes:
                    [CW - 150, 150], [("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#15803D" if good else "#B91C1C")),
                                      ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
                                      ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10)])
+    # Revenue lines: recorded income categories *and* the Commission / General
+    # revenue statements, so money recorded with /revenue shows up in the report.
+    revenue_rows = [(name, amount) for name, amount in (report.get("income") or [])]
+    revenue_rows += [(f"{name} (revenue statement)", amount)
+                     for name, amount in (report.get("statement_rows") or []) if amount]
     story = [Paragraph("Profit and Loss Statement", _st("t", fontName=FB, fontSize=20, leading=25, textColor=INK)),
              P(f"Period: {report['month']}   |   Currency: {cur}", S_SMALL), Spacer(1, 14),
-             section("Revenue", report["income"], "Total revenue", report["revenue"]), Spacer(1, 12),
+             section("Revenue", revenue_rows, "Total revenue", report["revenue"]), Spacer(1, 12),
              section("Expenses", report["expenses"], "Total expenses", report["expense_total"]), Spacer(1, 12), net_t]
     if report["revenue"]:
         story += [Spacer(1, 6), P(f"Net margin: {net / report['revenue'] * 100:.1f}%", S_SMALL)]

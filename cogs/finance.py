@@ -273,9 +273,13 @@ class Statements(commands.Cog):
         category="Revenue category",
         amount="Amount received (₹)",
         description="What the revenue was for",
+        received_from="Payment sender / received from (client, partner, investor)",
+        method="How it was received",
+        transaction_id="Payment ID / transaction reference",
+        remarks="Anything worth noting",
         date="Revenue date (YYYY-MM-DD), defaults to today",
     )
-    @app_commands.choices(company=_COMPANY_CHOICES, category=_REVENUE_CHOICES)
+    @app_commands.choices(company=_COMPANY_CHOICES, category=_REVENUE_CHOICES, method=_METHOD_CHOICES)
     async def add_revenue(
         self,
         interaction: discord.Interaction,
@@ -283,8 +287,15 @@ class Statements(commands.Cog):
         category: app_commands.Choice[str],
         amount: app_commands.Range[float, 0.01, 100_000_000.0],
         description: str,
+        received_from: str,
+        method: str = "upi",
+        transaction_id: str = "",
+        remarks: str = "",
         date: str = "",
     ) -> None:
+        if not received_from.strip():
+            await _bad(interaction, "Missing sender", "Say who the money was received from.")
+            return
         if date and not _DATE.match(date.strip()):
             await _bad(interaction, "Invalid date", f"`{date}` should look like `2026-10-26`.")
             return
@@ -297,14 +308,18 @@ class Statements(commands.Cog):
             return
         when = date.strip() or store._today()
         if duplicate_submission((interaction.user.id, "revenue", selected.key, category.value,
-                                 round(amount, 2), description.strip().lower(), when)):
+                                 round(amount, 2), description.strip().lower(),
+                                 received_from.strip().lower(), when)):
             await _bad(interaction, "Already recorded",
-                       "That revenue entry was just submitted. Check the statement channel before adding it again.")
+                       "That revenue entry was just submitted. Check the statement channel before "
+                       "adding it again.")
             return
 
         try:
             revenue_id = await self.bot.db.add_revenue(
-                interaction.user.id, selected.key, category.value, to_cents(amount), description, when
+                interaction.user.id, selected.key, category.value, to_cents(amount), description, when,
+                received_from=received_from, method=method, transaction_id=transaction_id,
+                remarks=remarks, recorded_by=interaction.user.display_name,
             )
         except ValueError as exc:
             await _bad(interaction, "Revenue not recorded", str(exc))
@@ -312,12 +327,13 @@ class Statements(commands.Cog):
 
         record = await self.bot.db.get_revenue(revenue_id) or {}
         record["number"] = revenue_number(revenue_id)
-        record["recorded_by"] = interaction.user.display_name
+        record["recorded_by"] = record.get("recorded_by") or interaction.user.display_name
+        totals = await self.bot.db.revenue_summary(selected.key)
         await _send_statement(
             interaction,
             channel,
             selected,
-            ui.revenue_card(record),
+            ui.revenue_card(record, totals),
             saved=True,
             done_title="Revenue recorded",
         )

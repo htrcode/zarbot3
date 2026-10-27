@@ -14,7 +14,7 @@ import config
 import ui
 from desk.database import ticket_number
 from desk.utils import (TICKET_KINDS, TICKET_PRIORITIES, company_choices, days_since, fmt,
-                   is_ticket_staff, safe_channel_name, staff_interaction_check, to_cents)
+                   is_ticket_staff, now_iso, safe_channel_name, staff_interaction_check, to_cents)
 from desk.views import TicketOpenPanelView, build_ticket_view, simple_card
 
 log = logging.getLogger("invoice-bot.tickets")
@@ -71,7 +71,16 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
-    def _overwrites(guild: discord.Guild, client_id: int | None, closed: bool = False):
+    def _overwrites(guild: discord.Guild, client_id: int | None, closed: bool = False,
+                    department: Optional[str] = None, drop_roles=()):
+        """Channel permissions for a ticket channel.
+
+        Access is granted to the ticket owner, the bot, the global ticket staff
+        roles (``TICKET_STAFF_ROLE_IDS``), the cross-department roles and the
+        ticket's own **department** staff (its category's roles). ``drop_roles``
+        are role ids that must be denied even when their category would grant
+        access — that is how the previous department is locked out on a move.
+        """
         overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
         member = guild.get_member(client_id) if client_id else None
         target = member or (discord.Object(id=client_id) if client_id else None)
@@ -80,12 +89,23 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 view_channel=not closed, send_messages=not closed, attach_files=not closed,
                 read_message_history=True, add_reactions=not closed, embed_links=not closed,
             )
-        for role_id in config.TICKET_STAFF_ROLE_IDS:
+        allowed = set(config.TICKET_STAFF_ROLE_IDS) | set(config.TICKET_CROSS_DEPARTMENT_ROLE_IDS)
+        allowed |= set(config.department_roles(department))
+        for role_id in allowed:
             role = guild.get_role(role_id)
             if role:
                 overwrites[role] = discord.PermissionOverwrite(
                     view_channel=True, send_messages=not closed, attach_files=not closed,
                     read_message_history=True, manage_messages=True, add_reactions=not closed,
+                )
+        for role_id in drop_roles:
+            if role_id in allowed:
+                continue  # global / cross-department staff are never removed
+            role = guild.get_role(role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=False, send_messages=False, read_message_history=False,
+                    attach_files=False, add_reactions=False, manage_messages=False,
                 )
         me = guild.me
         if me:
@@ -121,7 +141,49 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             await self.bot.db.ticket_by_channel(interaction.channel_id)
         if not ticket:
             raise ValueError("Ticket not found. Use this inside a ticket channel or pass a ticket ID.")
+        channel = await self._channel(ticket.get("channel_id"))
+        department = self.department_of(channel) if channel else None
+        if not self.can_manage(interaction.user, interaction.guild, department):
+            raise ValueError("This ticket belongs to another department, so you cannot manage it.")
         return ticket
+
+    # ------------------------------------------------------------------ departments
+    @staticmethod
+    def department_of(channel) -> Optional[str]:
+        """Ticket category key a channel sits in (None when it is not one of ours)."""
+        return config.category_key(getattr(channel, "category_id", None))
+
+    def can_manage(self, user, guild, department: Optional[str] = None) -> bool:
+        """Department-scoped staff check.
+
+        Administrators, the global ticket staff roles, the explicitly authorised
+        cross-department roles and the ticket's own department staff may manage a
+        ticket. Everyone else is refused here *and* kept out of the channel by its
+        permission overwrites, so they cannot read its contents either.
+        """
+        roles = getattr(user, "roles", None)
+        permissions = getattr(user, "guild_permissions", None)
+        if roles is None or permissions is None:
+            return False
+        if permissions.administrator or permissions.manage_channels:
+            return True
+        role_ids = {role.id for role in roles}
+        if role_ids & set(config.TICKET_STAFF_ROLE_IDS):
+            return True
+        if role_ids & set(config.TICKET_CROSS_DEPARTMENT_ROLE_IDS):
+            return True
+        if department:
+            return bool(role_ids & set(config.department_roles(department)))
+        # A ticket outside every configured department: any department staff may help.
+        return bool(role_ids & set(config.ALL_DEPARTMENT_ROLE_IDS)) or is_ticket_staff(user)
+
+    async def guard(self, interaction: discord.Interaction) -> bool:
+        """Reply with a department warning unless the caller may manage this ticket."""
+        department = self.department_of(interaction.channel)
+        if self.can_manage(interaction.user, interaction.guild, department):
+            return True
+        await ui.say(interaction, "🚫 This ticket belongs to another department.")
+        return False
 
     # ------------------------------------------------------------------ live dashboard
     def begin_create(self, user_id: int) -> bool:
@@ -283,7 +345,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             channel = await guild.create_text_channel(
                 safe_channel_name(f"{config.TICKET_PREFIX}-{subject}", 90),
                 category=category,
-                overwrites=self._overwrites(guild, client.id),
+                overwrites=self._overwrites(guild, client.id,
+                                            department=config.category_key(category_id) or "tickets"),
                 topic=f"{kind.title()} · {subject[:100]} · client {client}"[:1024],
                 reason=f"Ticket opened by {interaction.user}",
             )
@@ -434,7 +497,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 log.warning("Transcript failed for ticket %s: %s", ticket_id, e)
             kwargs = dict(
                 name=f"{config.TICKET_CLOSED_PREFIX}-{ticket_id:04d}",
-                overwrites=self._overwrites(guild, ticket.get("client_discord_id"), closed=True),
+                overwrites=self._overwrites(guild, ticket.get("client_discord_id"), closed=True,
+                                            department=self.department_of(channel)),
                 reason=f"Closed by {actor}",
             )
             closed_category = self._category(guild, config.TICKET_CLOSED_CATEGORY_ID)
@@ -467,12 +531,17 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             raise ValueError("That ticket is not closed.")
         channel = await self._channel(ticket.get("channel_id"))
         if channel:
+            category = self._category(guild, config.TICKET_DEFAULT_CATEGORY_ID or config.TICKET_CATEGORY_ID)
             kwargs = dict(
                 name=f"{config.TICKET_PREFIX}-{ticket_id:04d}",
-                overwrites=self._overwrites(guild, ticket.get("client_discord_id"), closed=False),
+                # Back to the default "Tickets" category: its department keeps access,
+                # every other department is locked out again.
+                overwrites=self._overwrites(
+                    guild, ticket.get("client_discord_id"), closed=False,
+                    department=config.category_key(category.id) if category else None,
+                    drop_roles=config.ALL_DEPARTMENT_ROLE_IDS),
                 reason=f"Reopened by {actor}",
             )
-            category = self._category(guild, config.TICKET_DEFAULT_CATEGORY_ID or config.TICKET_CATEGORY_ID)
             if category:
                 kwargs["category"] = category
                 self._moved[ticket_id] = category.name
@@ -489,79 +558,6 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         # The existing dashboard is edited in place by the database event (no second panel).
         return await self.bot.db.get_ticket(ticket_id)
 
-    # ------------------------------------------------------------------ complete purchase
-    def purchase_target(self, guild: discord.Guild, key: str):
-        """(label, category) for 'support' or 'partnership'. ValueError says what to fix."""
-        label, cid, var = {
-            "support": ("Technical Support", config.TICKET_SUPPORT_CATEGORY_ID, "TICKET_SUPPORT_CATEGORY_ID"),
-            "partnership": ("Partnership", config.TICKET_PARTNERSHIP_CATEGORY_ID, "TICKET_PARTNERSHIP_CATEGORY_ID"),
-        }[key]
-        if not cid:
-            raise ValueError(f"The {label} category is not configured. Set `{var}` in config.py.")
-        category = self._category(guild, cid)
-        if category is None:
-            raise ValueError(f"The {label} category (`{cid}`) was not found in this server. Check `{var}`.")
-        return label, category
-
-    async def complete_purchase(self, guild: discord.Guild, ticket_id: int, actor, key: str,
-                                details: dict) -> bool:
-        """Rename + move the SAME ticket channel and post the purchase summary.
-
-        Returns False if the move worked but the summary could not be posted.
-        Raises ValueError (already worded for staff) when nothing was changed.
-        """
-        ticket = await self.bot.db.get_ticket(ticket_id)
-        if not ticket:
-            raise ValueError("Ticket not found.")
-        if ticket["status"] == "closed":
-            raise ValueError("That ticket is closed. Reopen it first.")
-        if ticket.get("purchase_completed_at"):
-            raise ValueError("This purchase was already completed.")
-        label, category = self.purchase_target(guild, key)
-        channel = await self._channel(ticket.get("channel_id"))
-        if channel is None:
-            raise ValueError("The ticket channel no longer exists.")
-        me = guild.me
-        if me and not (channel.permissions_for(me).manage_channels
-                       and category.permissions_for(me).manage_channels):
-            raise ValueError(f"I need **Manage Channels** on this ticket and on the **{label}** category.")
-
-        # Claim first (atomic), so a double click / two staff members can never post twice.
-        if not await self.bot.db.claim_purchase_completion(actor.id, ticket_id, {**details, "moved_to": label}):
-            raise ValueError("This purchase was already completed.")
-        who = details["client"] if details["client"] != "Not provided" else ticket["client_name"]
-        try:
-            # No sync_permissions: the channel keeps its own overwrites, messages and history.
-            await channel.edit(name=safe_channel_name(f"{key}-{ticket_id:04d}-{who}", 90), category=category,
-                               reason=f"Purchase completed by {actor}")
-        except discord.Forbidden:
-            await self.bot.db.release_purchase_completion(actor.id, ticket_id)
-            raise ValueError("Discord refused the move (missing permissions). Nothing was changed.")
-        except discord.HTTPException as e:
-            await self.bot.db.release_purchase_completion(actor.id, ticket_id)
-            raise ValueError(f"Discord could not move the channel ({e.status}). Nothing was changed, try again.")
-
-        self._moved[ticket_id] = category.name
-        self.request_refresh(ticket_id)  # dashboard: new category, Complete Purchase greyed out
-        clean = lambda v: discord.utils.escape_markdown(discord.utils.escape_mentions(str(v)))[:200]
-        body = "\n".join([
-            ui._field("Client Name", clean(details["client"])),
-            ui._field("Service Name", clean(details["service"])),
-            ui._field("Payment Status", clean(details["payment"])),
-            ui._field("Server Name / UUID", clean(details["server"])),
-            ui._field("Expiry Date", clean(details["expiry"])),
-            ui._field("Moved To", label),
-            ui._field("Completed By", actor.mention),
-        ])
-        title = f"Purchase completed · {ticket_number(ticket_id)}"
-        await self._log(title, body)
-        try:
-            await channel.send(view=ui.build_card(title, body, timeout=180))
-            return True
-        except discord.HTTPException:
-            log.exception("Ticket %s moved but the purchase summary could not be posted", ticket_id)
-            return False
-
     # ------------------------------------------------------------------ move / rename
     def category_target(self, guild: discord.Guild, key: str):
         """(label, category) for a key of config.TICKET_CATEGORIES. ValueError says what to fix."""
@@ -573,12 +569,21 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             raise ValueError(f"The {label} category (`{cid}`) was not found in this server. Check `{var}`.")
         return label, category
 
-    async def move_ticket(self, guild: discord.Guild, ticket_id: int, actor, key: str,
+    async def move_ticket(self, guild: discord.Guild, ticket_id: int, actor, key: str, reason: str = "",
                           new_name: Optional[str] = None) -> str:
-        """Move (and optionally rename) the SAME channel. Permissions, messages and records stay as they are.
+        """Move (and optionally rename) the SAME ticket channel, with a reason.
+
+        The channel is edited in place, so messages, history, owner and records
+        survive. Access is handed over to the destination department: its staff gain
+        access and the previous department's staff lose it, except for
+        ``TICKET_STAFF_ROLE_IDS`` and ``TICKET_CROSS_DEPARTMENT_ROLE_IDS``. The reason
+        is saved as a timestamped dashboard note and in the move history.
 
         Raises ValueError (worded for staff) when nothing was changed.
         """
+        reason = " ".join((reason or "").split())
+        if not reason:
+            raise ValueError("A reason for moving the ticket is required.")
         ticket = await self.bot.db.get_ticket(ticket_id)
         if not ticket:
             raise ValueError("Ticket not found.")
@@ -589,8 +594,9 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         if channel is None:
             raise ValueError("The ticket channel no longer exists.")
 
+        previous_key = self.department_of(channel)
         wanted = safe_channel_name(new_name, 90) if (new_name or "").strip() else channel.name
-        changes = {}
+        changes: dict = {}
         if channel.category_id != category.id:
             changes["category"] = category
         if wanted != channel.name:
@@ -603,12 +609,19 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             raise ValueError(f"I need **Manage Channels** on this ticket and on the **{label}** category.")
         if ticket_id in self._moving:
             raise ValueError("This ticket is already being moved. Wait a moment and check the channel.")
+        if "category" in changes:
+            # Department handover: the destination team gets access, the previous one is denied.
+            changes["overwrites"] = self._overwrites(
+                guild, ticket.get("client_discord_id"), department=key,
+                drop_roles=[rid for rid in config.ALL_DEPARTMENT_ROLE_IDS
+                            if rid not in config.department_roles(key)],
+            )
 
         before = {"category": getattr(channel.category, "name", None), "name": channel.name}
         self._moving.add(ticket_id)
         try:
-            # No sync_permissions / overwrites: the channel keeps its own permissions and history.
-            await asyncio.wait_for(channel.edit(reason=f"Moved by {actor}", **changes), timeout=20)
+            # No sync_permissions: the channel keeps its own messages and history.
+            await asyncio.wait_for(channel.edit(reason=f"Moved by {actor}: {reason}"[:500], **changes), timeout=20)
         except asyncio.TimeoutError:
             raise ValueError("Discord did not answer in time (channel edits are rate limited, renames to "
                              "2 per 10 minutes). Check the channel, then try again later.")
@@ -620,25 +633,41 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         finally:
             self._moving.discard(ticket_id)
 
+        destination = label if "category" in changes else before["category"]
         self._moved[ticket_id] = category.name if "category" in changes else before["category"]
+        came_from = config.department_label(previous_key) if previous_key else (before["category"] or "—")
+        who = getattr(actor, "display_name", None) or str(actor)
+        where = f"#{before['name']} → #{wanted}" if "name" in changes else f"#{wanted}"
+        gain = config.department_roles(key) if "category" in changes else []
+        loss = config.department_roles(previous_key) if "category" in changes and previous_key != key else []
+        access_note = "; ".join(part for part in (
+            f"{label} staff gained access" if gain else "",
+            f"{config.department_label(previous_key)} staff lost access" if loss else "") if part) or "unchanged"
+        note = f"[{now_iso()}] Moved {came_from} → **{destination}** ({where}) by {who} — reason: {reason}"
         try:
             await self.bot.db.record_ticket_move(actor.id, ticket_id, {
-                "from": before, "to": {"category": label if "category" in changes else before["category"],
-                                       "name": wanted}})  # also refreshes the dashboard
+                "from": before, "reason": reason, "by": who, "at": now_iso(),
+                "permissions": {"department": key if "category" in changes else previous_key,
+                                "access": access_note},
+                "to": {"category": destination,
+                       "name": wanted if "name" in changes else before["name"]}})
+            await self.bot.db.add_ticket_note(actor.id, ticket_id, note)  # dashboard/history note
         except Exception:
             log.exception("Ticket %s moved but the history entry failed", ticket_id)
-            self.request_refresh(ticket_id)
+        self.request_refresh(ticket_id)  # dashboard: new category, new note
         await self._log(f"Ticket moved · {ticket_number(ticket_id)}", "\n".join([
             ui._field("Moved By", actor.mention),
-            ui._field("Category", f"{before['category'] or '—'} → {label}" if "category" in changes
-                      else before["category"] or "—"),
-            ui._field("Channel", f"#{before['name']} → #{wanted}" if "name" in changes else f"#{wanted}")]))
+            ui._field("Reason", reason),
+            ui._field("Category", f"{came_from} → {label}" if "category" in changes else came_from),
+            ui._field("Channel", where),
+            ui._field("Access", access_note)]))
         done = []
         if "category" in changes:
             done.append(f"moved to **{label}**")
         if "name" in changes:
             done.append(f"renamed to **#{wanted}**")
-        return f"{ticket_number(ticket_id)} " + " and ".join(done) + "."
+        handover = f" Access: {access_note}." if access_note != "unchanged" else ""
+        return f"{ticket_number(ticket_id)} " + " and ".join(done) + "." + handover
 
     # ------------------------------------------------------------------ commands
     @app_commands.command(name="open", description="Open a numbered ticket channel for a client")

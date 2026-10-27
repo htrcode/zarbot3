@@ -14,8 +14,8 @@ import ui
 from desk.database import invoice_number, primary_service, ticket_number
 from desk.pdf_gen import invoice_pdf, pnl_pdf
 import config
-from desk.utils import (STAGE_META, TICKET_PRIORITIES, days_since, dmy, fmt, is_staff, is_ticket_staff,
-                        parse_date, shift_month, to_cents)
+from desk.utils import (STAGE_META, TICKET_PRIORITIES, days_since, dmy, duplicate_submission, fmt,
+                        is_staff, is_ticket_staff, shift_month, to_cents)
 
 log = logging.getLogger("invoice-bot.views")
 
@@ -363,7 +363,7 @@ class DashboardView(discord.ui.LayoutView):
         net = report["net"]
         inc = "\n".join(f"• {n}: {fmt(a)}" for n, a in report["income"]) or "• none"
         exp = "\n".join(f"• {n}: {fmt(a)}" for n, a in report["expenses"]) or "• none"
-        rev = "\n".join(f"• {n}: {fmt(a)}" for n, a in report.get("revenue_rows", [])) or "• none"
+        rev = "\n".join(f"• {n}: {fmt(a)}" for n, a in report.get("statement_rows") or []) or "• none"
         scope = config.company_name(self.company) if self.company else "All companies"
         row = discord.ui.ActionRow()
         for label, cb in (("◀ Prev", self.on_prev), ("Next ▶", self.on_next)):
@@ -373,11 +373,19 @@ class DashboardView(discord.ui.LayoutView):
         pdf = discord.ui.Button(label="P&L PDF", style=discord.ButtonStyle.primary, emoji="📄")
         pdf.callback = self.on_pdf
         row.add_item(pdf)
+        # Revenue reported by /revenue is part of Operating Revenue, so it is shown
+        # as its own labelled line (Commission / General). Investment is capital and
+        # is never added to revenue or profit.
+        statement_total = report.get("statement_total",
+                                     sum(a for _, a in report.get("statement_rows") or []))
+        income_total = report.get("income_total", report["revenue"] - statement_total)
         items = ui.card_items(
             f"Finance · {self.month} · {scope}",
-            f"{_f('Operating Revenue', fmt(report['revenue']))}\n{inc}",
-            f"{_f('Revenue Statements', fmt(report.get('revenue_total', 0)))}\n{rev}\n"
-            f"-# Investment is tracked separately and is not part of revenue or profit.",
+            f"{_f('Operating Revenue', fmt(report['revenue']))}\n"
+            f"{_f('· Recorded income', fmt(income_total))}\n{inc}",
+            f"{_f('· Revenue statements (Commission / General)', fmt(statement_total))}\n{rev}",
+            f"{_f('Investment (tracked separately)', fmt(report.get('investment', 0)))}\n"
+            "-# Investment is capital: it is never part of revenue or profit.",
             f"{_f('Expenses', fmt(report['expense_total']))}\n{exp}",
             f"{_f('Net Profit' if net >= 0 else 'Net Loss', fmt(net))}\n"
             f"{_f('Outstanding Invoices (all time)', fmt(outstanding))}",
@@ -421,9 +429,10 @@ STATUS_ICON = {"open": "🟢", "pending": "🟡", "closed": "⚫"}
 def ticket_blocks(ticket: dict, deal: dict | None = None, invoice: dict | None = None,
                   notes: list | None = None, parent: dict | None = None,
                   category: str | None = None) -> tuple[str, str]:
+    # The dashboard deliberately shows neither the ticket type nor the financial
+    # company: the category (department) is the workflow label, and a ticket's
+    # company only matters in the invoice / finance flows that ask for it.
     fields = [
-        _f("Type", f"{ticket['kind'].title()}"),
-        _f("Company", config.company_name(ticket.get("company_id"))),
         _f("Category", _esc(category) if category else "—"),
         _f("Subject", _esc(ticket["subject"][:180])),
         _f("Client Name", f"{_esc(ticket['client_name'])} ({_who(ticket.get('client_discord_id'))})"),
@@ -485,11 +494,11 @@ class CloseTicketModal(discord.ui.Modal, title="Close ticket"):
         self.ticket_id = ticket_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not is_ticket_staff(interaction.user):
-            return await ui.say(interaction, "🚫 Ticket staff only.")
         service = getattr(interaction.client, "tickets", None)
         if not service:
             return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
+        if not await service.guard(interaction):
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await service.close_ticket(interaction.guild, self.ticket_id, interaction.user, self.reason.value)
@@ -508,8 +517,11 @@ class TicketNoteModal(discord.ui.Modal, title="Internal note"):
         self.ticket_id = ticket_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not is_ticket_staff(interaction.user):
-            return await ui.say(interaction, "🚫 Ticket staff only.")
+        service = getattr(interaction.client, "tickets", None)
+        if not service:
+            return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
+        if not await service.guard(interaction):
+            return
         await interaction.client.db.add_ticket_note(interaction.user.id, self.ticket_id, self.note.value)
         await ui.say(interaction, "📝 Note saved.")  # the dashboard refreshes from the database event
 
@@ -526,149 +538,72 @@ class FollowUpTicketModal(discord.ui.Modal, title="New linked ticket"):
         self.parent_id = parent_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not is_ticket_staff(interaction.user):
-            return await ui.say(interaction, "🚫 Ticket staff only.")
         service = getattr(interaction.client, "tickets", None)
         if not service:
             return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
+        if not await service.guard(interaction):
+            return
         await service.open_ticket(interaction, client=None, kind="purchase", subject=self.subject.value,
                                   details=self.details.value, parent_id=self.parent_id)
 
 
-PURCHASE_TARGETS = {"support": "Technical Support", "partnership": "Partnership"}
-
-
-class PurchaseModal(discord.ui.Modal):
-    """Step 2 of Complete Purchase (a modal holds at most 5 inputs, so the category is picked first)."""
-    client = discord.ui.TextInput(label="Client name", max_length=100)
-    service = discord.ui.TextInput(label="Service name", max_length=100,
-                                   placeholder="4GB VPS / Minecraft panel / Discord bot")
-    payment = discord.ui.TextInput(label="Payment status", max_length=40,
-                                   placeholder="Paid / Unpaid / Partially paid")
-    server = discord.ui.TextInput(label="Server name / UUID (optional)", required=False, max_length=100)
-    expiry = discord.ui.TextInput(label="Expiry date (optional)", required=False, max_length=10,
-                                  placeholder="YYYY-MM-DD, e.g. 2026-11-27")
-
-    def __init__(self, ticket: dict, key: str, panel_message=None):
-        super().__init__(title=f"Complete purchase → {PURCHASE_TARGETS[key]}"[:45])
-        self.ticket_id, self.channel_id, self.key, self.panel_message = ticket["id"], ticket["channel_id"], key, panel_message
-        self.client.default = (ticket.get("client_name") or "")[:100] or None
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_ticket_staff(interaction.user):
-            return await ui.say(interaction, "🚫 Ticket staff only.")
-        service = getattr(interaction.client, "tickets", None)
-        if not service:
-            return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
-        if interaction.guild is None or interaction.channel_id != self.channel_id:
-            return await ui.say(interaction, "❌ Use this inside the ticket channel.")
-        expiry = ""
-        if self.expiry.value.strip():
-            try:
-                expiry = parse_date(self.expiry.value)
-            except ValueError as e:
-                return await ui.say(interaction, f"❌ {e}")
-        val = lambda field, fallback="Not provided": field.value.strip() or fallback
-        details = {"client": val(self.client), "service": val(self.service), "payment": val(self.payment),
-                   "server": val(self.server), "expiry": expiry or "Not provided"}
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            posted = await service.complete_purchase(interaction.guild, self.ticket_id, interaction.user,
-                                                     self.key, details)
-        except (ValueError, discord.HTTPException) as e:
-            return await ui.say(interaction, f"❌ {e}")
-        await ui.say(interaction, f"✅ Purchase completed, ticket moved to **{PURCHASE_TARGETS[self.key]}**."
-                     if posted else "⚠️ Ticket moved, but I could not post the summary in the channel.")
-        # The dashboard (Complete Purchase greyed out, new category) is refreshed by Tickets.complete_purchase.
-
-
-class PurchaseTargetView(ui.PersistentView):
-    """Ephemeral step 1: pick the destination category, then the modal opens."""
-
-    def __init__(self, bot, ticket: dict, panel_message=None):
-        super().__init__(timeout=120)
-        self.bot, self.ticket, self.panel_message = bot, ticket, panel_message
-        select = discord.ui.Select(placeholder="Destination category", options=[
-            discord.SelectOption(label="Technical Support", value="support", emoji="🛠️"),
-            discord.SelectOption(label="Partnership", value="partnership", emoji="🤝")])
-        select.callback = self.on_pick
-        self.add_item(discord.ui.Container(*ui.card_items(
-            "Complete purchase", "Where should this ticket go?", rows=[discord.ui.ActionRow(select)])))
-
-    async def on_pick(self, interaction: discord.Interaction):
-        if not is_ticket_staff(interaction.user):
-            return await ui.say(interaction, "🚫 Ticket staff only.")
-        key = interaction.data["values"][0]
-        service = getattr(self.bot, "tickets", None)
-        if not service or key not in PURCHASE_TARGETS:
-            return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
-        try:
-            service.purchase_target(interaction.guild, key)  # fail now, not after the form is filled in
-        except ValueError as e:
-            return await ui.say(interaction, f"❌ {e}")
-        await interaction.response.send_modal(PurchaseModal(self.ticket, key, self.panel_message))
-
-
 class MoveTicketModal(discord.ui.Modal):
-    """Step 2 of Move: optional new channel name."""
-    new_name = discord.ui.TextInput(label="Channel name (optional)", required=False, max_length=90,
-                                    placeholder="Leave unchanged to keep the current name")
+    """Move a ticket: the destination category and the reason are both required.
 
-    def __init__(self, ticket: dict, key: str, current_name: str):
-        super().__init__(title=f"Move → {config.TICKET_CATEGORIES[key][0]}"[:45])
-        self.ticket_id, self.channel_id, self.key = ticket["id"], ticket["channel_id"], key
-        self.new_name.default = current_name[:90] or None
+    One form does everything — the destination department and a short reason are
+    mandatory, the channel name is optional. Nothing is moved until it is submitted.
+    """
 
-    async def on_submit(self, interaction: discord.Interaction):
-        if not is_ticket_staff(interaction.user):
-            return await ui.say(interaction, "🚫 Ticket staff only.")
-        service = getattr(interaction.client, "tickets", None)
-        if not service:
-            return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
-        if interaction.guild is None or interaction.channel_id != self.channel_id:
-            return await ui.say(interaction, "❌ Use this inside the ticket channel.")
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            result = await service.move_ticket(interaction.guild, self.ticket_id, interaction.user,
-                                               self.key, self.new_name.value)
-        except (ValueError, discord.HTTPException) as e:
-            return await ui.say(interaction, f"❌ {e}")
-        await ui.say(interaction, f"✅ {result}")
-
-
-class MoveTargetView(ui.PersistentView):
-    """Ephemeral step 1: pick the destination category, then the rename form opens."""
-
-    def __init__(self, bot, ticket: dict, channel):
-        super().__init__(timeout=120)
-        self.bot, self.ticket = bot, ticket
+    def __init__(self, ticket: dict, channel=None):
+        super().__init__(title="Move ticket")
+        self.ticket_id, self.channel_id = ticket["id"], ticket["channel_id"]
         current = getattr(channel, "category_id", None)
         options = [discord.SelectOption(label=label, value=key,
                                         description="Current category" if cid == current else None)
                    for key, (label, _var, cid) in config.TICKET_CATEGORIES.items() if cid]
-        select = discord.ui.Select(placeholder="Destination category", options=options)
-        select.callback = self.on_pick
-        self.add_item(discord.ui.Container(*ui.card_items(
-            "Move ticket", "Pick a category. You can rename the channel in the next step.",
-            rows=[discord.ui.ActionRow(select)])))
+        self.destination = discord.ui.Select(custom_id="move:destination", min_values=1, max_values=1,
+                                            placeholder="Destination category", options=options)
+        self.reason = discord.ui.TextInput(
+            custom_id="move:reason", label="Reason for moving", required=True, max_length=300,
+            style=discord.TextStyle.paragraph,
+            placeholder="Client paid in full — hand this over to Technical Support")
+        self.new_name = discord.ui.TextInput(
+            custom_id="move:name", label="Channel name (optional)", required=False, max_length=90,
+            placeholder="Leave unchanged to keep the current name")
+        if getattr(channel, "name", ""):
+            self.new_name.default = channel.name[:90]
+        self.add_item(discord.ui.Label(
+            text="Destination category", component=self.destination,
+            description="The department that takes over this ticket"))
+        self.add_item(discord.ui.Label(
+            text="Reason for moving", component=self.reason,
+            description="Saved on the dashboard and in the move history"))
+        self.add_item(discord.ui.Label(text="Channel name", component=self.new_name))
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if is_ticket_staff(interaction.user):
-            return True
-        await ui.say(interaction, "🚫 Ticket staff only.")
-        return False
-
-    async def on_pick(self, interaction: discord.Interaction):
-        key = interaction.data["values"][0]
-        service = getattr(self.bot, "tickets", None)
-        if not service or key not in config.TICKET_CATEGORIES:
+    async def on_submit(self, interaction: discord.Interaction):
+        service = getattr(interaction.client, "tickets", None)
+        if not service:
             return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
+        if interaction.guild is None or interaction.channel_id != self.channel_id:
+            return await ui.say(interaction, "❌ Use this inside the ticket channel.")
+        if not await service.guard(interaction):
+            return
+        key = (getattr(self.destination, "values", None) or [""])[0]
+        if key not in config.TICKET_CATEGORIES:
+            return await ui.say(interaction, "❌ Pick a destination category.")
+        reason = (self.reason.value or "").strip()
+        if not reason:
+            return await ui.say(interaction, "❌ A reason for moving the ticket is required.")
+        if duplicate_submission((interaction.user.id, "ticket-move", self.ticket_id, key, reason.lower())):
+            return await ui.say(interaction, "⏳ That move was just submitted. Check the channel, then "
+                                            "try again if it did not go through.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            service.category_target(interaction.guild, key)  # fail now, not after the form is filled in
-        except ValueError as e:
+            result = await service.move_ticket(interaction.guild, self.ticket_id, interaction.user, key,
+                                               reason, self.new_name.value)
+        except (ValueError, discord.HTTPException) as e:
             return await ui.say(interaction, f"❌ {e}")
-        name = getattr(interaction.channel, "name", "") or ""
-        await interaction.response.send_modal(MoveTicketModal(self.ticket, key, name))
+        await ui.say(interaction, f"✅ {result}")
 
 
 class TicketPanelView(discord.ui.LayoutView):
@@ -687,13 +622,13 @@ class TicketPanelView(discord.ui.LayoutView):
             return b
 
         claim_label = "Unclaim" if ticket.get("claimed_by") else "Claim"
+        # One ticket-movement action only: "Move" (which asks for a destination and a
+        # reason). There is deliberately no separate "Complete Purchase" step.
         row1 = discord.ui.ActionRow(
             btn(claim_label, "claim", discord.ButtonStyle.secondary, self.on_claim, disabled=closed, emoji="🙋"),
             btn("Create Invoice", "invoice", discord.ButtonStyle.primary, self.on_invoice, emoji="🧾"),
             btn("Linked Ticket", "follow", discord.ButtonStyle.secondary, self.on_follow,
                 disabled=closed, emoji="➕"),
-            btn("Complete Purchase", "complete", discord.ButtonStyle.success, self.on_complete,
-                disabled=closed or bool(ticket.get("purchase_completed_at")), emoji="✅"),
         )
         close_btn = (btn("Reopen", "reopen", discord.ButtonStyle.success, self.on_reopen, emoji="🔓")
                      if closed else
@@ -718,15 +653,18 @@ class TicketPanelView(discord.ui.LayoutView):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Server-side gate for EVERY control on the dashboard (buttons and the priority select)."""
-        if is_ticket_staff(interaction.user):
-            return True
-        await ui.say(interaction, "🚫 Ticket staff only.")
-        return False
+        return await self._staff(interaction)
 
     async def _staff(self, interaction) -> bool:
-        if is_ticket_staff(interaction.user):
+        """Department check: only this ticket's department (or cross-department staff) may use it."""
+        service = getattr(self.bot, "tickets", None)
+        department = config.category_key(getattr(interaction.channel, "category_id", None))
+        if service is not None:
+            if service.can_manage(interaction.user, interaction.guild, department):
+                return True
+        elif is_ticket_staff(interaction.user):
             return True
-        await ui.say(interaction, "🚫 Ticket staff only.")
+        await ui.say(interaction, "🚫 This ticket belongs to another department.")
         return False
 
     async def _ack(self, interaction: discord.Interaction):
@@ -754,7 +692,7 @@ class TicketPanelView(discord.ui.LayoutView):
             return await ui.say(interaction, "ℹ️ This ticket is closed. Reopen it before moving it.")
         if not any(cid for _, _, cid in config.TICKET_CATEGORIES.values()):
             return await ui.say(interaction, "❌ No ticket categories are configured. Set the `TICKET_*_CATEGORY_ID` values in config.py.")
-        await interaction.response.send_message(view=MoveTargetView(self.bot, ticket, interaction.channel), ephemeral=True)
+        await interaction.response.send_modal(MoveTicketModal(ticket, interaction.channel))
 
     async def on_claim(self, interaction: discord.Interaction):
         if not await self._staff(interaction):
@@ -783,17 +721,6 @@ class TicketPanelView(discord.ui.LayoutView):
         if not await self._staff(interaction):
             return
         await interaction.response.send_modal(TicketNoteModal(self.ticket_id))
-
-    async def on_complete(self, interaction: discord.Interaction):
-        if not await self._staff(interaction):
-            return
-        ticket = await self.bot.db.get_ticket(self.ticket_id)  # fresh: this view can be stale after a restart
-        if not ticket or ticket["status"] == "closed":
-            return await ui.say(interaction, "ℹ️ This ticket is closed.")
-        if ticket.get("purchase_completed_at"):
-            return await ui.say(interaction, "ℹ️ This purchase was already completed.")
-        await interaction.response.send_message(
-            view=PurchaseTargetView(self.bot, ticket, interaction.message), ephemeral=True)
 
     async def on_sales(self, interaction: discord.Interaction):
         if not await self._staff(interaction):
