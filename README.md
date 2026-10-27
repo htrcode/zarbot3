@@ -67,6 +67,12 @@ moving the ticket between Discord categories never changes it.
 **Sales pipeline** (`/sales ...`): `pipeline`, `list`, `deal`, `ticket`, `add`, `stage`, `followup`, `note`, `won`, `lost`, `due`.
 Purchase / enquiry tickets create deals automatically; invoices move them to Quoted, full payment marks them Won.
 
+**Announcements**
+
+| Command | What it does |
+|---|---|
+| `/embed` | Post a card (`## title`, message body, `-# footer`) in the chosen channel. `channel`, `title` and `footer` are command options; the message itself is typed in a form, where title and footer can still be edited. Staff only, never pings anyone |
+
 **Finance** (`/finance ...`): `income`, `expense`, `category-add`, `transactions`, `void`, `audit`, `dashboard`, `pnl`.
 `income`/`expense` require a company; `transactions`, `dashboard` and `pnl` accept an optional company
 (omitted = all companies). The dashboard and P&L list Commission / Investment / General separately;
