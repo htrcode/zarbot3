@@ -19,6 +19,7 @@ import config  # noqa: E402
 import ui  # noqa: E402
 from desk import views  # noqa: E402
 from desk.database import Database  # noqa: E402
+from desk import pdf_gen  # noqa: E402
 from desk.pdf_gen import pnl_pdf  # noqa: E402
 from desk.tickets import Tickets  # noqa: E402
 
@@ -88,6 +89,39 @@ class _Guild:
 
     def get_member(self, member_id):
         return self.members.get(member_id)
+
+
+class _Response:
+    """Interaction response that records modals/messages and can refuse a modal."""
+
+    def __init__(self, allow_modal=True):
+        self.allow_modal, self.modals, self.messages = allow_modal, [], []
+
+    def is_done(self):
+        return bool(self.modals or self.messages)
+
+    async def send_modal(self, modal):
+        if not self.allow_modal:
+            raise RuntimeError("Discord refused the modal")
+        self.modals.append(modal)
+
+    async def send_message(self, **kwargs):
+        self.messages.append(kwargs)
+
+
+class _Interaction:
+    def __init__(self, channel, user, guild=None, response=None, client=None):
+        self.channel, self.user, self.guild = channel, user, guild
+        self.channel_id = channel.id
+        self.response = response or _Response()
+        self.client = client or types.SimpleNamespace(tickets=None)
+
+
+class _ExplodingDB:
+    """Any database call fails the test: a dashboard button must answer first."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the control must not touch the database (tried {name})")
 
 
 def _custom_ids(components):
@@ -331,6 +365,7 @@ class RevenueCardTests(unittest.TestCase):
         self.assertIn("₹2,500.00", text)
         self.assertIn("**Total Revenue:**", text)
         self.assertIn("Investment (tracked separately)", text)
+        self.assertIn("**Total received (revenue + investment):** ₹7,500.00", text)
 
 
 class RevenueCommandTests(unittest.TestCase):
@@ -362,6 +397,7 @@ class FinanceDashboardTests(unittest.TestCase):
         self.assertIn("**Operating Revenue:** ₹6,000.00", text)
         self.assertIn("Revenue statements (Commission / General)", text)
         self.assertIn("**Investment (tracked separately):** ₹10,000.00", text)
+        self.assertIn("**Total received (revenue + investment):** ₹16,000.00", text)
 
 
 class TicketDashboardTests(_Departments, unittest.TestCase):
@@ -382,6 +418,13 @@ class TicketDashboardTests(_Departments, unittest.TestCase):
         self.assertIn("ticket:move:1", ids)
         self.assertIn("ticket:close:1", ids)
         self.assertNotIn("ticket:complete:1", ids)
+
+    def test_the_dashboard_has_no_sales_pipeline_line(self):
+        deal = {"id": 3, "stage": "new", "budget": 0, "value": 0, "next_follow_up": "2026-10-29"}
+        _fields, more = views.ticket_blocks(dict(self.ticket), deal)
+        self.assertNotIn("**Sales:**", more)
+        self.assertNotIn("New enquiry", more)
+        self.assertNotIn("follow-up 2026-10-29", more)
 
 
 class MoveModalTests(_Departments, unittest.TestCase):
@@ -408,6 +451,278 @@ class MoveModalTests(_Departments, unittest.TestCase):
         ], {})
         self.assertEqual(modal.destination.values, ["support"])
         self.assertEqual(modal.reason.value, "client paid")
+
+
+# --------------------------------------------------------------------------- move button
+class MoveButtonTests(_Departments, unittest.IsolatedAsyncioTestCase):
+    """The dashboard's Move button must answer inside Discord's 3 second window."""
+
+    ticket = {"id": 1, "subject": "Need a VPS", "kind": "purchase", "priority": "normal",
+              "status": "open", "client_name": "Acme", "client_discord_id": 5,
+              "company_id": "zarbunex", "claimed_by": None, "opened_by": 9, "deal_id": None,
+              "created_at": "2026-10-27", "last_activity": "2026-10-28", "channel_id": 500}
+
+    def _view(self):
+        # No usable database: the button must not need one to open the form.
+        bot = types.SimpleNamespace(tickets=types.SimpleNamespace(can_manage=lambda *a: True),
+                                    db=_ExplodingDB())
+        return views.TicketPanelView(bot, dict(self.ticket))
+
+    async def test_the_form_opens_without_touching_the_database(self):
+        interaction = _Interaction(_Channel(category=_Category(111, "Billing")), _Member(9))
+        await self._view().on_move(interaction)
+        self.assertEqual(len(interaction.response.modals), 1)   # the form is sent
+        self.assertEqual(interaction.response.messages, [])      # and nothing failed
+
+    async def test_a_form_that_cannot_open_still_answers(self):
+        interaction = _Interaction(_Channel(category=_Category(111, "Billing")), _Member(9),
+                                   response=_Response(allow_modal=False))
+        with self.assertLogs(views.log, level="ERROR"):   # the failure is logged, not swallowed
+            await self._view().on_move(interaction)
+        self.assertEqual(interaction.response.modals, [])
+        self.assertEqual(len(interaction.response.messages), 1)  # never a silent timeout
+
+
+# --------------------------------------------------------------------------- P&L
+class PnlStatementTests(unittest.TestCase):
+    """Investment is visible on the statement and in its totals, but never revenue."""
+
+    report = {"month": "2026-10", "company": "hectorhost",
+              "income": [("Hosting Revenue", 100000)], "income_total": 100000,
+              "expenses": [("Hosting & servers", 50000)], "expense_total": 50000,
+              "statement_rows": [("Commission", 0), ("General", 0)], "statement_total": 0,
+              "revenue": 100000, "net": 50000,
+              "revenue_rows": [("Commission", 0), ("Investment", 1000000), ("General", 0)],
+              "revenue_total": 1000000, "investment": 1000000}
+
+    @staticmethod
+    def _walk(item):
+        """Text of a story item, including the cells of ReportLab tables."""
+        if isinstance(item, str):
+            yield item
+        elif hasattr(item, "getPlainText"):
+            yield item.getPlainText()
+        for row in getattr(item, "_cellvalues", None) or ():
+            for cell in row:
+                yield from PnlStatementTests._walk(cell)
+
+    def _text(self) -> str:
+        captured = {}
+
+        def capture(story, *args, **kwargs):
+            captured["story"] = story
+            return b"%PDF"
+
+        original, pdf_gen._build = pdf_gen._build, capture
+        try:
+            self.assertTrue(pnl_pdf(dict(self.report)).startswith(b"%PDF"))
+        finally:
+            pdf_gen._build = original
+        return "\n".join(text for item in captured["story"] for text in self._walk(item))
+
+    def test_investment_gets_its_own_section_and_a_total_received_line(self):
+        text = self._text()
+        self.assertIn("INVESTMENT (TRACKED SEPARATELY)", text)
+        self.assertIn("Total investment", text)
+        self.assertIn("Total received (revenue + investment)", text)
+        self.assertIn(pdf_gen.money(1000000, config.CURRENCY), text)
+        self.assertIn(pdf_gen.money(1100000, config.CURRENCY), text)   # revenue + investment
+
+    def test_investment_is_still_kept_out_of_revenue_and_profit(self):
+        text = self._text()
+        self.assertIn("never in revenue or net profit", text)
+        self.assertIn(pdf_gen.money(100000, config.CURRENCY), text)    # Total revenue
+        self.assertIn("NET PROFIT", text)
+
+
+# --------------------------------------------------------------------------- voiding
+class RevenueVoidTests(unittest.IsolatedAsyncioTestCase):
+    """A wrong Revenue Statement is cancelled, not deleted, and leaves every total."""
+
+    async def asyncSetUp(self):
+        self.dir = tempfile.mkdtemp(prefix="zarbot-revenue-void-")
+        self.db = Database(os.path.join(self.dir, "void.db"))
+        await self.db.connect()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    async def test_voiding_removes_it_from_totals_reports_and_the_pnl(self):
+        commission = await self.db.add_revenue(1, "zarbunex", "Commission", 500000, "Referral",
+                                               "2026-10-05")
+        await self.db.add_revenue(1, "zarbunex", "Investment", 1000000, "Seed capital", "2026-10-06")
+        await self.db.add_revenue(1, "hectorhost", "General", 20000, "Misc income", "2026-10-07")
+
+        voided = await self.db.void_revenue(1, commission, "wrong amount, entered twice")
+        self.assertEqual(voided["voided"], 1)
+        self.assertEqual(voided["void_reason"], "wrong amount, entered twice")
+        self.assertTrue(voided["voided_at"])
+
+        report = await self.db.month_report("2026-10", "zarbunex")
+        self.assertEqual(report["revenue"], 0)                      # no longer revenue
+        self.assertEqual(report["net"], 0)                          # nor profit
+        self.assertEqual(dict(report["statement_rows"])["Commission"], 0)
+        self.assertEqual(report["investment"], 1000000)             # investment untouched
+        self.assertEqual(report["revenue_total"], 1000000)
+        self.assertTrue(pnl_pdf(dict(report)).startswith(b"%PDF"))
+
+        summary = await self.db.revenue_summary("zarbunex")
+        self.assertEqual((summary["operating"], summary["investment"]), (0, 1000000))
+        listed = [r["id"] for r in await self.db.list_revenue("2026-10", "zarbunex")]
+        self.assertNotIn(commission, listed)                         # gone from the list
+        self.assertEqual(len(listed), 1)                             # the Investment entry stays
+        # Another company keeps its own books.
+        self.assertEqual((await self.db.month_report("2026-10", "hectorhost"))["revenue"], 20000)
+
+    async def test_the_record_and_its_audit_line_are_kept(self):
+        revenue_id = await self.db.add_revenue(1, "zarbunex", "General", 100000, "Panel", "2026-10-05")
+        await self.db.void_revenue(1, revenue_id, "entered under the wrong company")
+        stored = await self.db.get_revenue(revenue_id)                # never deleted
+        self.assertEqual(stored["amount"], 100000)
+        self.assertEqual(stored["void_reason"], "entered under the wrong company")
+        audit = [r["action"] for r in await self.db.recent_audit(10)]
+        self.assertIn("revenue.void", audit)
+        listed = await self.db.recent_revenue("zarbunex", include_voided=True)
+        self.assertEqual([(r["id"], r["voided"]) for r in listed], [(revenue_id, 1)])
+
+    async def test_voiding_twice_or_without_a_reason_is_refused(self):
+        revenue_id = await self.db.add_revenue(1, "zarbunex", "General", 100000, "Panel", "2026-10-05")
+        with self.assertRaises(ValueError):
+            await self.db.void_revenue(1, revenue_id, "   ")
+        with self.assertRaises(ValueError):
+            await self.db.void_revenue(1, 999, "typo")
+        await self.db.void_revenue(1, revenue_id, "typo")
+        with self.assertRaises(ValueError):
+            await self.db.void_revenue(1, revenue_id, "typo")
+
+
+class StatementEntryVoidTests(unittest.IsolatedAsyncioTestCase):
+    """Sales/expense statement entries are voided by id too, and stay linked to the books."""
+
+    async def asyncSetUp(self):
+        import data as store
+
+        self.store = store
+        self.dir = tempfile.mkdtemp(prefix="zarbot-ledger-void-")
+        self.path = os.path.join(self.dir, "data.json")
+        self.original = store.DATA_FILE
+        store.DATA_FILE = self.path
+        self.db = Database(os.path.join(self.dir, "ledger.db"))
+        await self.db.connect()
+        self.bot = types.SimpleNamespace(db=self.db)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.store.DATA_FILE = self.original
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _expense(self, amount=500.0):
+        return self.store.add_expense(
+            description="Server", category="Hosting & servers", amount=amount, method="upi",
+            paid_to="Host", transaction_id="UTR-1", remarks="", date="2026-10-05",
+            recorded_by="Wixz", company="zarbunex")
+
+    async def test_a_wrong_expense_leaves_the_statement_totals(self):
+        from desk.bridge import mirror_expense
+
+        record = self._expense()
+        self.assertEqual(record["id"], 1)
+        tx_id = await mirror_expense(self.bot, record, 1)
+        self.assertTrue(tx_id)
+        self.assertEqual(self.store.total_expenses(company="zarbunex"), 500.0)
+
+        self.store.void_entry("expense", record["id"], "wrong amount")
+        self.assertEqual(self.store.total_expenses(company="zarbunex"), 0.0)
+        self.assertEqual(self.store.expenses(company="zarbunex"), [])
+        with self.assertRaises(ValueError):
+            self.store.void_entry("expense", record["id"], "again")
+        with self.assertRaises(ValueError):
+            self.store.void_entry("expense", 999, "no such entry")
+
+    async def test_list_entries_gives_the_id_to_void_and_hides_voided_ones(self):
+        first = self._expense(amount=100.0)
+        second = self._expense(amount=200.0)
+
+        rows = self.store.list_entries("expense", "zarbunex")
+        self.assertEqual([r["id"] for r in rows], [second["id"], first["id"]])
+
+        self.store.void_entry("expense", first["id"], "wrong amount")
+        listed = self.store.list_entries("expense", "zarbunex")
+        self.assertNotIn(first["id"], [r["id"] for r in listed])
+        both = self.store.list_entries("expense", "zarbunex", include_voided=True)
+        self.assertTrue(next(r for r in both if r["id"] == first["id"])["voided"])
+        # Another company never sees it.
+        self.assertEqual(self.store.list_entries("expense", "hectorhost"), [])
+
+    async def test_voiding_the_books_entry_cancels_its_statement_entry(self):
+        from desk.bridge import mirror_expense
+
+        record = self._expense(amount=250.0)
+        tx_id = await mirror_expense(self.bot, record, 1)
+        stored = self.store._load()["expenses"][0]
+        self.assertEqual(stored["ref"], f"tx:{tx_id}")              # the books are linked
+
+        row = await self.db.void_transaction(1, tx_id, "duplicate entry")
+        self.assertEqual(row["amount"], 25000)
+        kind, entry = self.store.void_by_ref(f"tx:{tx_id}", "duplicate entry")
+        self.assertEqual(kind, "expense")
+        self.assertTrue(entry["voided"])
+        self.assertEqual(self.store.total_expenses(company="zarbunex"), 0.0)
+
+    def test_old_entries_without_ids_get_stable_ones(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"invoices": [], "next_invoice": 1001, "payments": [
+                {"date": "2026-10-01", "amount": 100.0, "company": "zarbunex"},
+                {"date": "2026-10-02", "amount": 200.0, "company": "zarbunex"},
+            ]}, fh)
+        first = sorted(p["id"] for p in self.store.payments(company="zarbunex"))
+        second = sorted(p["id"] for p in self.store.payments(company="zarbunex"))
+        self.assertEqual(first, [1, 2])
+        self.assertEqual(second, [1, 2])                             # same ids every load
+
+
+class VoidCommandTests(unittest.TestCase):
+    def test_the_void_commands_take_an_id_and_a_reason(self):
+        from cogs.finance import Statements
+
+        cog = Statements(object())
+        commands = {c.name: c for c in cog.get_app_commands()}
+        for name in ("revenue-void", "revenue-list"):
+            self.assertIn(name, commands)
+        void = commands["revenue-void"]
+        self.assertEqual([p.name for p in void.parameters], ["entry", "reason"])
+        self.assertTrue(all(p.required for p in void.parameters))
+
+    def test_the_expense_commands_take_an_id_and_a_reason(self):
+        from cogs.finance import Statements
+
+        cog = Statements(object())
+        commands = {c.name: c for c in cog.get_app_commands()}
+        for name in ("expense-void", "expense-list"):
+            self.assertIn(name, commands)
+        void = commands["expense-void"]
+        self.assertEqual([p.name for p in void.parameters], ["entry", "reason"])
+        self.assertTrue(all(p.required for p in void.parameters))
+
+    def test_the_expense_id_accepts_every_form(self):
+        from cogs.finance import _EXPENSE_ID, expense_number
+
+        for text in ("EXP-0003", "exp-3", "EXP3", "3", "  #3 "):
+            match = _EXPENSE_ID.match(text)
+            self.assertIsNotNone(match, text)
+            self.assertEqual(int(match.group(1)), 3)
+        self.assertIsNone(_EXPENSE_ID.match("EXP-"))
+        self.assertEqual(expense_number(7), "EXP-0007")
+
+    def test_the_revenue_id_accepts_every_form(self):
+        from cogs.finance import _REVENUE_ID
+
+        for text in ("REV-0003", "rev-3", "3", "  REV3 "):
+            match = _REVENUE_ID.match(text)
+            self.assertIsNotNone(match, text)
+            self.assertEqual(int(match.group(1)), 3)
+        self.assertIsNone(_REVENUE_ID.match("REV-"))
 
 
 if __name__ == "__main__":

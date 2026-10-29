@@ -199,8 +199,13 @@ async def mirror_sale(bot, sale: dict, actor_id: int):
     try:
         await db.ensure_category("Hosting Revenue", "income")
         text = f"Sale: {sale.get('client_name') or '—'} — {sale.get('service') or 'service'}"
-        await db.add_transaction(actor_id, "income", "Hosting Revenue", to_cents(sale["amount"]),
-                                 text, store._entry_date(sale), company_id=sale.get("company") or None)
+        tx_id = await db.add_transaction(actor_id, "income", "Hosting Revenue", to_cents(sale["amount"]),
+                                         text, store._entry_date(sale),
+                                         company_id=sale.get("company") or None)
+        # Link the two books so voiding either side cancels the statement entry too.
+        if tx_id and sale.get("id"):
+            store.set_ref("payment", sale["id"], f"tx:{tx_id}")
+        return tx_id
     except Exception:
         log.exception("Could not mirror the sale into the finance books")
 
@@ -213,9 +218,12 @@ async def mirror_expense(bot, expense: dict, actor_id: int):
         category = expense.get("category") or "Other Expenses"
         await db.ensure_category(category, "expense")
         text = f"{expense.get('description') or category} — {expense.get('paid_to') or ''}".strip(" —")
-        await db.add_transaction(actor_id, "expense", category, to_cents(expense["amount"]),
-                                 text, str(expense.get("date", ""))[:10],
-                                 company_id=expense.get("company") or None)
+        tx_id = await db.add_transaction(actor_id, "expense", category, to_cents(expense["amount"]),
+                                         text, str(expense.get("date", ""))[:10],
+                                         company_id=expense.get("company") or None)
+        if tx_id and expense.get("id"):
+            store.set_ref("expense", expense["id"], f"tx:{tx_id}")
+        return tx_id
     except Exception:
         log.exception("Could not mirror the expense into the finance books")
 
@@ -224,7 +232,8 @@ async def mirror_expense(bot, expense: dict, actor_id: int):
 # SQLite finance commands -> ledger + statements
 # ---------------------------------------------------------------------------
 async def record_finance(bot, kind: str, category: str, amount_cents: int, description: str,
-                         date: str, actor_name: str, company_id: str | None = None):
+                         date: str, actor_name: str, company_id: str | None = None,
+                         txn_id: int | None = None):
     """Mirror ``/finance income|expense`` into the ledger and post its statement.
 
     Returns ``(ok, message)`` from :func:`post_company`.
@@ -235,6 +244,8 @@ async def record_finance(bot, kind: str, category: str, amount_cents: int, descr
             client_name="", client_contact="", server_name="", server_uuid="", service=category,
             amount=amount, method="other", transaction_id="", remarks=description, date=date,
             recorded_by=actor_name, company=company_id or "", extra={"source": "finance"})
+        if txn_id and sale.get("id"):
+            store.set_ref("payment", sale["id"], f"tx:{txn_id}")
         if config.get_company(sale.get("company")) is None:
             if not config.STATEMENTS_CHANNEL_ID:
                 return False, "no company was given and `STATEMENTS_CHANNEL_ID` is not set."
@@ -247,6 +258,8 @@ async def record_finance(bot, kind: str, category: str, amount_cents: int, descr
         description=description or category, category=category, amount=amount, method="other",
         paid_to="", transaction_id="", remarks="", date=date, recorded_by=actor_name,
         company=company_id or "", extra={"source": "finance"})
+    if txn_id and expense.get("id"):
+        store.set_ref("expense", expense["id"], f"tx:{txn_id}")
     if config.get_company(expense.get("company")) is None:
         if not config.STATEMENTS_CHANNEL_ID:
             return False, "no company was given and `STATEMENTS_CHANNEL_ID` is not set."

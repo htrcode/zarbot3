@@ -414,13 +414,24 @@ def pnl_pdf(report: dict) -> bytes:
     revenue_rows = [(name, amount) for name, amount in (report.get("income") or [])]
     revenue_rows += [(f"{name} (revenue statement)", amount)
                      for name, amount in (report.get("statement_rows") or []) if amount]
+    # Investment recorded through /revenue gets its own section and its own total, so
+    # capital is visible on the statement without ever being counted as revenue.
+    investment = report.get("investment") or 0
+    capital_rows = [(n, a) for n, a in (report.get("revenue_rows") or [])
+                    if n == "Investment" and a] or [("Investment contributions", investment)]
     story = [Paragraph("Profit and Loss Statement", _st("t", fontName=FB, fontSize=20, leading=25, textColor=INK)),
              P(f"Period: {report['month']}   |   Currency: {cur}", S_SMALL), Spacer(1, 14),
              section("Revenue", revenue_rows, "Total revenue", report["revenue"]), Spacer(1, 12),
-             section("Expenses", report["expenses"], "Total expenses", report["expense_total"]), Spacer(1, 12), net_t]
+             section("Investment (tracked separately)", capital_rows, "Total investment", investment),
+             Spacer(1, 12),
+             section("Expenses", report["expenses"], "Total expenses", report["expense_total"]),
+             Spacer(1, 12), net_t, Spacer(1, 12),
+             section("Summary", [("Total revenue", report["revenue"]),
+                                 ("Investment received (capital)", investment),
+                                 ("Total expenses", report["expense_total"])],
+                     "Total received (revenue + investment)", report["revenue"] + investment)]
     if report["revenue"]:
         story += [Spacer(1, 6), P(f"Net margin: {net / report['revenue'] * 100:.1f}%", S_SMALL)]
-    if report.get("investment"):
-        story += [Spacer(1, 4), P("Investment contributions are recorded separately and are not part "
-                                  f"of revenue or profit: {money(report['investment'], cur)}.", S_SMALL)]
+    story += [Spacer(1, 4), P("Investment contributions are capital: they are counted above and in "
+                              f"Total received, but never in revenue or net profit.", S_SMALL)]
     return _build(story, page, page, H - 82, f"Profit and Loss {report['month']}")

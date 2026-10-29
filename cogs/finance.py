@@ -8,7 +8,9 @@ picked explicitly: nothing defaults to the first company in the list.
 
 from __future__ import annotations
 
+import logging
 import re
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -17,11 +19,21 @@ from discord.ext import commands
 import config
 import data as store
 import ui
-from desk.bridge import mirror_expense, mirror_sale
+from desk.bridge import mirror_expense, mirror_sale, post_company
 from desk.database import revenue_number
 from desk.utils import duplicate_submission, staff_interaction_check, to_cents
 
+log = logging.getLogger("invoice-bot.statements")
+
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# REV-0003, REV3 or 3 — the id printed on every Revenue Statement.
+_REVENUE_ID = re.compile(r"^\s*(?:REV[-\s]?)?(\d{1,9})\s*$", re.IGNORECASE)
+# EXP-0003, EXP3 or 3 — the id /expense-list prints for an Expense Statement.
+_EXPENSE_ID = re.compile(r"^\s*#?(?:EXP[-\s]?)?(\d{1,9})\s*$", re.IGNORECASE)
+
+
+def expense_number(entry_id: int) -> str:
+    return f"EXP-{entry_id:04d}"
 
 _PERIOD_CHOICES = [
     app_commands.Choice(name=label, value=key) for key, label in store.PERIODS.items()
@@ -336,6 +348,202 @@ class Statements(commands.Cog):
             ui.revenue_card(record, totals),
             saved=True,
             done_title="Revenue recorded",
+        )
+
+    # -- voiding a wrong statement ------------------------------------------
+    @app_commands.command(
+        name="revenue-void",
+        description="Void a wrong Revenue Statement so it stops counting in every total",
+    )
+    @app_commands.describe(
+        entry="Revenue Statement id (REV-0003 or 3)",
+        reason="Why it is being voided",
+    )
+    async def revenue_void(self, interaction: discord.Interaction, entry: str, reason: str) -> None:
+        match = _REVENUE_ID.match(entry or "")
+        if match is None:
+            await _bad(interaction, "Invalid id",
+                       "Use the id on the statement, e.g. `REV-0003` or `3`.")
+            return
+        if not reason.strip():
+            await _bad(interaction, "Missing reason", "Say why this entry is being voided.")
+            return
+        revenue_id = int(match.group(1))
+        record = await self.bot.db.get_revenue(revenue_id)
+        if record is None:
+            await _bad(interaction, "Not found", f"There is no Revenue Statement `REV-{revenue_id:04d}`.")
+            return
+        if record.get("voided"):
+            await _bad(interaction, "Already void", f"`REV-{revenue_id:04d}` is already void.")
+            return
+        try:
+            voided = await self.bot.db.void_revenue(interaction.user.id, revenue_id, reason)
+        except ValueError as exc:
+            await _bad(interaction, "Revenue not voided", str(exc))
+            return
+
+        company = config.get_company(voided.get("company_id"))
+        note = "-# No company was attached, so nothing was posted."
+        if company is not None:
+            body = "\n".join([
+                ui._field("Transaction ID", revenue_number(revenue_id)),
+                ui._field("Company", company.name),
+                ui._field("Category", voided.get("category") or "—"),
+                ui._field("Amount", store.money((voided.get("amount") or 0) / 100)),
+                ui._field("Reason", reason),
+                ui._field("Voided By", interaction.user.mention),
+            ])
+            try:
+                ok, message = await post_company(
+                    interaction.client, company.key,
+                    ui.notice("Revenue Statement voided", body))
+            except Exception:
+                log.exception("Could not post the revenue void notice")
+                ok, message = False, "an unexpected error (it was logged)"
+            note = (f"-# Void notice posted to {message}." if ok
+                    else f"-# ⚠️ Void notice not posted: {message}")
+
+        totals = await self.bot.db.revenue_summary(company.key if company else None)
+        await ui.say(
+            interaction,
+            f"⚫ {revenue_number(revenue_id)} voided\n"
+            f"{ui._field('Category', voided.get('category') or '—')}\n"
+            f"{ui._field('Amount', store.money((voided.get('amount') or 0) / 100))}\n"
+            f"{ui._field('Reason', reason)}\n"
+            f"{ui._field('Operating revenue now', store.money((totals.get('operating') or 0) / 100))}\n"
+            f"-# Removed from totals, reports and the P&L (the record is kept for audit).\n{note}",
+        )
+
+    @app_commands.command(name="revenue-list", description="Recent Revenue Statements with the id to void")
+    @app_commands.describe(company="Only this company", include_voided="Also list voided entries")
+    @app_commands.choices(company=_COMPANY_CHOICES)
+    async def revenue_list(
+        self,
+        interaction: discord.Interaction,
+        company: Optional[app_commands.Choice[str]] = None,
+        include_voided: bool = False,
+    ) -> None:
+        rows = await self.bot.db.recent_revenue(
+            company.value if company else None, limit=20, include_voided=include_voided)
+        lines = [
+            f"{'⚫' if row.get('voided') else '🟢'} `{revenue_number(row['id'])}` · "
+            f"{row['occurred_on']} · {config.company_name(row.get('company_id'))} · "
+            f"{row.get('category') or '—'} · **{store.money((row.get('amount') or 0) / 100)}** · "
+            f"{row.get('received_from') or '—'}"
+            for row in rows
+        ]
+        title = "Revenue Statements" + (f" · {company.name}" if company else "")
+        await interaction.response.send_message(
+            view=ui.build_card(title, "\n".join(lines) or "No Revenue Statements yet.", timeout=180),
+            ephemeral=True,
+        )
+
+    # -- voiding a wrong expense statement ----------------------------------
+    @app_commands.command(
+        name="expense-void",
+        description="Void a wrong Expense Statement so it stops counting in every total",
+    )
+    @app_commands.describe(
+        entry="Expense Statement id (EXP-0003 or 3)",
+        reason="Why it is being voided",
+    )
+    async def expense_void(self, interaction: discord.Interaction, entry: str, reason: str) -> None:
+        match = _EXPENSE_ID.match(entry or "")
+        if match is None:
+            await _bad(interaction, "Invalid id",
+                       "Use the id from `/expense-list`, e.g. `EXP-0003` or `3`.")
+            return
+        if not reason.strip():
+            await _bad(interaction, "Missing reason", "Say why this entry is being voided.")
+            return
+        entry_id = int(match.group(1))
+        record = store.entry("expense", entry_id)
+        if record is None:
+            await _bad(interaction, "Not found",
+                       f"There is no Expense Statement `{expense_number(entry_id)}`.")
+            return
+        if record.get("voided"):
+            await _bad(interaction, "Already void",
+                       f"`{expense_number(entry_id)}` is already void.")
+            return
+        try:
+            voided = store.void_entry("expense", entry_id, reason)
+        except ValueError as exc:
+            await _bad(interaction, "Expense not voided", str(exc))
+            return
+
+        # The same expense is mirrored into the finance books; void that side too so the
+        # dashboard, the reports and the P&L stop counting it.
+        ref = str(voided.get("ref") or "")
+        note = "-# It was not linked to a finance entry."
+        if ref.startswith("tx:"):
+            try:
+                await self.bot.db.void_transaction(interaction.user.id, int(ref[3:]), reason)
+                note = f"-# Finance entry #{ref[3:]} was voided too."
+            except ValueError as exc:
+                note = (f"-# Finance entry #{ref[3:]} was already void."
+                        if "already void" in str(exc).lower()
+                        else f"-# ⚠️ Finance entry #{ref[3:]} was not voided: {exc}")
+            except Exception:
+                log.exception("Could not void the finance entry linked to expense %s", entry_id)
+                note = f"-# ⚠️ Finance entry #{ref[3:]} could not be voided (it was logged)."
+
+        company = config.get_company(voided.get("company"))
+        posted = "-# No company was attached, so nothing was posted."
+        if company is not None:
+            body = "\n".join([
+                ui._field("Statement ID", expense_number(entry_id)),
+                ui._field("Company", company.name),
+                ui._field("Expense", voided.get("description") or voided.get("category") or "—"),
+                ui._field("Amount", store.money(voided.get("amount") or 0)),
+                ui._field("Reason", reason),
+                ui._field("Voided By", interaction.user.mention),
+            ])
+            try:
+                ok, message = await post_company(
+                    interaction.client, company.key,
+                    ui.notice("Expense Statement voided", body))
+            except Exception:
+                log.exception("Could not post the expense void notice")
+                ok, message = False, "an unexpected error (it was logged)"
+            posted = (f"-# Void notice posted to {message}." if ok
+                      else f"-# ⚠️ Void notice not posted: {message}")
+
+        total = store.total_expenses(company=voided.get("company") or None)
+        await ui.say(
+            interaction,
+            f"⚫ {expense_number(entry_id)} voided\n"
+            f"{ui._field('Expense', voided.get('description') or voided.get('category') or '—')}\n"
+            f"{ui._field('Amount', store.money(voided.get('amount') or 0))}\n"
+            f"{ui._field('Reason', reason)}\n"
+            f"{ui._field('Expenses now', store.money(total))}\n"
+            f"-# Removed from totals, reports and the P&L (the record is kept for audit).\n"
+            f"{note}\n{posted}",
+        )
+
+    @app_commands.command(name="expense-list", description="Recent Expense Statements with the id to void")
+    @app_commands.describe(company="Only this company", include_voided="Also list voided entries")
+    @app_commands.choices(company=_COMPANY_CHOICES)
+    async def expense_list(
+        self,
+        interaction: discord.Interaction,
+        company: Optional[app_commands.Choice[str]] = None,
+        include_voided: bool = False,
+    ) -> None:
+        rows = store.list_entries(
+            "expense", company.value if company else None,
+            include_voided=include_voided, limit=20)
+        lines = [
+            f"{'⚫' if row.get('voided') else '🟢'} `{expense_number(row['id'])}` · "
+            f"{store._entry_date(row)} · {config.company_name(row.get('company'))} · "
+            f"{row.get('category') or '—'} · **{store.money(row.get('amount') or 0)}** · "
+            f"{row.get('description') or '—'}"
+            for row in rows
+        ]
+        title = "Expense Statements" + (f" · {company.name}" if company else "")
+        await interaction.response.send_message(
+            view=ui.build_card(title, "\n".join(lines) or "No Expense Statements yet.", timeout=180),
+            ephemeral=True,
         )
 
     # -- period statements --------------------------------------------------

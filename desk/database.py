@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS revenue (
     recorded_by TEXT,
     occurred_on TEXT NOT NULL,
     voided INTEGER NOT NULL DEFAULT 0,
+    void_reason TEXT,
+    voided_at TEXT,
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -228,7 +230,8 @@ NEW_COLUMNS = {
     "payments": {"transaction_id": "TEXT", "company_id": "TEXT"},
     "transactions": {"company_id": "TEXT"},
     "revenue": {"received_from": "TEXT", "method": "TEXT", "transaction_id": "TEXT",
-                "remarks": "TEXT", "recorded_by": "TEXT"},
+                "remarks": "TEXT", "recorded_by": "TEXT", "void_reason": "TEXT",
+                "voided_at": "TEXT"},
     "tickets": {"purchase_completed_at": "TEXT", "panel_message_id": "INTEGER",
                 "company_id": "TEXT"},
     "invoice_items": {
@@ -1087,6 +1090,7 @@ class Database:
             await self._audit(actor_id, "transaction.void", "transaction", tx_id,
                               {"reason": reason, "amount": row["amount"]})
             await self.conn.commit()
+            return dict(row)
 
     async def transactions(self, month: str, kind: str | None = None, limit: int = 20,
                            company_id: str | None = None):
@@ -1135,6 +1139,42 @@ class Database:
     async def get_revenue(self, revenue_id: int):
         row = await self.fetchone("SELECT * FROM revenue WHERE id=?", (revenue_id,))
         return dict(row) if row else None
+
+    async def void_revenue(self, actor_id, revenue_id: int, reason: str):
+        """Void a Revenue Statement: it stays in the books for audit but leaves every total."""
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("A reason is required.")
+        async with self.lock:
+            row = await self.fetchone("SELECT * FROM revenue WHERE id=?", (revenue_id,))
+            if not row:
+                raise ValueError("Revenue statement not found.")
+            if row["voided"]:
+                raise ValueError("Already void.")
+            await self.conn.execute(
+                "UPDATE revenue SET voided=1, void_reason=?, voided_at=? WHERE id=?",
+                (reason[:200], dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                 revenue_id),
+            )
+            await self._audit(actor_id, "revenue.void", "revenue", revenue_id,
+                              {"reason": reason, "amount": row["amount"],
+                               "company": row["company_id"]})
+            await self.conn.commit()
+            return dict(await self.fetchone("SELECT * FROM revenue WHERE id=?", (revenue_id,)))
+
+    async def recent_revenue(self, company_id: str | None = None, limit: int = 15,
+                             include_voided: bool = False):
+        """Newest Revenue Statements, with the ids the void command takes."""
+        sql = "SELECT * FROM revenue WHERE 1=1"
+        params: list = []
+        if company_id:
+            sql += " AND company_id=?"
+            params.append(company_id)
+        if not include_voided:
+            sql += " AND voided=0"
+        sql += " ORDER BY occurred_on DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(r) for r in await self.fetchall(sql, params)]
 
     async def revenue_totals(self, month: str, company_id: str | None = None) -> dict:
         """Per-category totals for a month (missing categories are absent from the dict)."""

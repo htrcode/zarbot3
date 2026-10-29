@@ -471,6 +471,9 @@ def revenue_card(revenue: Dict[str, Any], totals: Optional[Dict[str, Any]] = Non
         if totals.get("investment"):
             items.append(discord.ui.TextDisplay(_field(
                 "Investment (tracked separately)", store.money(totals["investment"] / 100))))
+        items.append(discord.ui.TextDisplay(_field(
+            "Total received (revenue + investment)",
+            store.money(((totals.get("operating") or 0) + (totals.get("investment") or 0)) / 100))))
     footer_items(items, f"Recorded {_when(revenue.get('created_at'))}")
     return _single(PersistentView(timeout=None), items)
 

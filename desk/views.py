@@ -386,6 +386,7 @@ class DashboardView(discord.ui.LayoutView):
             f"{_f('· Revenue statements (Commission / General)', fmt(statement_total))}\n{rev}",
             f"{_f('Investment (tracked separately)', fmt(report.get('investment', 0)))}\n"
             "-# Investment is capital: it is never part of revenue or profit.",
+            f"{_f('Total received (revenue + investment)', fmt(report['revenue'] + (report.get('investment') or 0)))}",
             f"{_f('Expenses', fmt(report['expense_total']))}\n{exp}",
             f"{_f('Net Profit' if net >= 0 else 'Net Loss', fmt(net))}\n"
             f"{_f('Outstanding Invoices (all time)', fmt(outstanding))}",
@@ -445,11 +446,10 @@ def ticket_blocks(ticket: dict, deal: dict | None = None, invoice: dict | None =
     ]
     if parent:
         fields.append(_f("Follow-up Of", f"{ticket_number(parent['id'])} · {_esc(parent['subject'][:80])}"))
+    # The pipeline line (stage / budget / follow-up) is deliberately absent: the
+    # dashboard shows what the ticket is, not the deal behind it. The Sales button
+    # opens the deal itself, invoice details still show here.
     more = []
-    if deal:
-        label = STAGE_META.get(deal["stage"], (deal["stage"], 0))[0]
-        more.append(_f("Sales", f"{label} · budget {fmt(deal['budget'])} · value {fmt(deal['value'])}"
-                       + (f" · follow-up {deal['next_follow_up']}" if deal.get("next_follow_up") else "")))
     if invoice:
         more.append(_f("Invoice", f"{invoice['number']} · {invoice['status']} · balance "
                        f"{fmt(invoice['balance'], invoice['currency'])}"))
@@ -581,6 +581,9 @@ class MoveTicketModal(discord.ui.Modal):
         self.add_item(discord.ui.Label(text="Channel name", component=self.new_name))
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Answer the form immediately: moving edits a real channel and channel edits
+        # are rate limited, so anything after this can outlast Discord's 3 seconds.
+        await interaction.response.defer(ephemeral=True, thinking=True)
         service = getattr(interaction.client, "tickets", None)
         if not service:
             return await ui.say(interaction, "ℹ️ Ticket system is still starting up.")
@@ -597,12 +600,15 @@ class MoveTicketModal(discord.ui.Modal):
         if duplicate_submission((interaction.user.id, "ticket-move", self.ticket_id, key, reason.lower())):
             return await ui.say(interaction, "⏳ That move was just submitted. Check the channel, then "
                                             "try again if it did not go through.")
-        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             result = await service.move_ticket(interaction.guild, self.ticket_id, interaction.user, key,
                                                reason, self.new_name.value)
         except (ValueError, discord.HTTPException) as e:
             return await ui.say(interaction, f"❌ {e}")
+        except Exception as e:  # never a silent failure on a control that edits a channel
+            log.exception("Move failed for ticket %s", self.ticket_id)
+            return await ui.say(interaction, f"❌ The move failed (`{e}`). Nothing was changed; "
+                                              "check the ticket and try again.")
         await ui.say(interaction, f"✅ {result}")
 
 
@@ -685,14 +691,27 @@ class TicketPanelView(discord.ui.LayoutView):
         await self._ack(interaction)
 
     async def on_move(self, interaction: discord.Interaction):
+        """Open the move form (destination category + reason).
+
+        Nothing here waits on the database or on Discord before answering: the ticket
+        and the destination list are already in memory, so the form is sent inside
+        Discord's 3 second window (a slow query used to make this button answer too
+        late, which the client shows as "didn't respond in time"). If the form cannot
+        be built or sent the click is still answered with the reason.
+        """
         if not await self._staff(interaction):
             return
-        ticket = await self.bot.db.get_ticket(self.ticket_id)
-        if not ticket or ticket["status"] == "closed":
+        ticket = self.ticket
+        if not ticket or ticket.get("status") == "closed":
             return await ui.say(interaction, "ℹ️ This ticket is closed. Reopen it before moving it.")
         if not any(cid for _, _, cid in config.TICKET_CATEGORIES.values()):
             return await ui.say(interaction, "❌ No ticket categories are configured. Set the `TICKET_*_CATEGORY_ID` values in config.py.")
-        await interaction.response.send_modal(MoveTicketModal(ticket, interaction.channel))
+        try:
+            await interaction.response.send_modal(MoveTicketModal(ticket, interaction.channel))
+        except Exception as exc:  # never leave the click unanswered
+            log.exception("Could not open the move form for ticket %s", self.ticket_id)
+            await ui.say(interaction, f"❌ I could not open the move form (`{exc}`). Try again, or "
+                                      "refresh the panel with `/ticket panel`.")
 
     async def on_claim(self, interaction: discord.Interaction):
         if not await self._staff(interaction):

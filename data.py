@@ -27,7 +27,41 @@ PERIODS: Dict[str, str] = {
 # store plumbing
 # --------------------------------------------------------------------------
 def _empty() -> Dict[str, Any]:
-    return {"invoices": [], "payments": [], "expenses": [], "next_invoice": 1001}
+    return {"invoices": [], "payments": [], "expenses": [], "next_invoice": 1001, "next_entry": 1}
+
+
+def _normalise(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Give every sale/expense entry a stable ``id`` (older files have none).
+
+    Ids are handed out in file order, which never changes because entries are only
+    ever appended, so an entry keeps the same id every time the file is loaded.
+    """
+    used = set()
+    for kind in ("payments", "expenses"):
+        for row in data.get(kind) or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                row_id = int(row.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if row_id > 0:
+                used.add(row_id)
+    try:
+        next_id = max(int(data.get("next_entry") or 1), (max(used) + 1) if used else 1)
+    except (TypeError, ValueError):
+        next_id = 1
+    for kind in ("payments", "expenses"):
+        for row in data.get(kind) or []:
+            if not isinstance(row, dict) or row.get("id"):
+                continue
+            while next_id in used:
+                next_id += 1
+            row["id"] = next_id
+            used.add(next_id)
+            next_id += 1
+    data["next_entry"] = next_id
+    return data
 
 
 def _load() -> Dict[str, Any]:
@@ -41,7 +75,7 @@ def _load() -> Dict[str, Any]:
         return _empty()
     data = _empty()
     data.update(raw)
-    return data
+    return _normalise(data)
 
 
 def _save(data: Dict[str, Any]) -> None:
@@ -182,7 +216,10 @@ def mark_paid(
     target["paid_method"] = method
     target["company"] = chosen
 
+    entry_id = data["next_entry"]
+    data["next_entry"] = entry_id + 1
     sale = {
+        "id": entry_id,
         "date": _today(),
         "client_name": target["customer"],
         "client_contact": target.get("contact", ""),
@@ -212,7 +249,8 @@ def _in_company(row: Dict[str, Any], company: Optional[str]) -> bool:
 
 
 def payments(start: str = "", company: Optional[str] = None) -> List[Dict[str, Any]]:
-    rows = [p for p in _load()["payments"] if _entry_date(p) >= start and _in_company(p, company)]
+    rows = [p for p in _load()["payments"]
+            if _entry_date(p) >= start and _in_company(p, company) and not p.get("voided")]
     return sorted(rows, key=lambda p: (_entry_date(p), p.get("created_at", "")), reverse=True)
 
 
@@ -236,7 +274,10 @@ def add_payment(
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = _load()
+    entry_id = data["next_entry"]
+    data["next_entry"] = entry_id + 1
     record = {
+        "id": entry_id,
         "date": date.strip() or _today(),
         "client_name": client_name.strip(),
         "client_contact": client_contact.strip(),
@@ -263,7 +304,8 @@ def add_payment(
 # --------------------------------------------------------------------------
 def expenses(start: str = "", company: Optional[str] = None) -> List[Dict[str, Any]]:
     rows = [e for e in _load()["expenses"]
-            if str(e.get("date", "")) >= start and _in_company(e, company)]
+            if str(e.get("date", "")) >= start and _in_company(e, company)
+            and not e.get("voided")]
     return sorted(rows, key=lambda e: (e.get("date", ""), e.get("created_at", "")), reverse=True)
 
 
@@ -285,7 +327,10 @@ def add_expense(
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     data = _load()
+    entry_id = data["next_entry"]
+    data["next_entry"] = entry_id + 1
     record = {
+        "id": entry_id,
         "date": date.strip() or _today(),
         "description": description.strip(),
         "category": category.strip() or "General",
@@ -309,3 +354,79 @@ def has_ref(ref: str) -> bool:
     """True if a sale/expense carrying this external reference was already recorded."""
     data = _load()
     return any(r.get("ref") == ref for r in data["payments"] + data["expenses"])
+
+
+# --------------------------------------------------------------------------
+# voiding a wrong entry (never deleted: kept for audit, left out of every total)
+# --------------------------------------------------------------------------
+_ENTRY_KEY = {"payment": "payments", "sale": "payments", "expense": "expenses"}
+
+
+def _entries(data: Dict[str, Any], kind: str) -> List[Dict[str, Any]]:
+    key = _ENTRY_KEY.get(kind)
+    if key is None:
+        raise ValueError("Unknown entry kind.")
+    return data[key]
+
+
+def entry(kind: str, entry_id: int) -> Optional[Dict[str, Any]]:
+    for row in _entries(_load(), kind):
+        if row.get("id") == entry_id:
+            return row
+    return None
+
+
+def list_entries(kind: str, company: Optional[str] = None, *, include_voided: bool = False,
+                 limit: int = 20) -> List[Dict[str, Any]]:
+    """Newest statement entries of ``kind`` ("payment" or "expense"), with their ids."""
+    rows = [row for row in _entries(_load(), kind)
+            if _in_company(row, company) and (include_voided or not row.get("voided"))]
+    rows.sort(key=lambda row: (_entry_date(row), row.get("id") or 0), reverse=True)
+    return rows[:max(1, int(limit))]
+
+
+def void_entry(kind: str, entry_id: int, reason: str) -> Dict[str, Any]:
+    """Cancel a sale/expense statement entry by id; it stops counting in every total."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("A reason is required.")
+    data = _load()
+    for row in _entries(data, kind):
+        if row.get("id") != entry_id:
+            continue
+        if row.get("voided"):
+            raise ValueError("That entry is already void.")
+        row["voided"] = True
+        row["void_reason"] = reason[:200]
+        row["voided_at"] = _stamp()
+        _save(data)
+        return row
+    raise ValueError("No statement entry with that ID.")
+
+
+def set_ref(kind: str, entry_id: int, ref: str) -> None:
+    """Link a ledger entry to its SQLite transaction (``tx:<id>``)."""
+    data = _load()
+    for row in _entries(data, kind):
+        if row.get("id") == entry_id:
+            row["ref"] = ref
+            _save(data)
+            return
+
+
+def void_by_ref(ref: str, reason: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Void the ledger entry linked to ``ref`` (used when a transaction is voided)."""
+    reason = (reason or "").strip()
+    if not ref or not reason:
+        return None, None
+    data = _load()
+    for kind in ("payments", "expenses"):
+        for row in data[kind]:
+            if row.get("ref") != ref or row.get("voided"):
+                continue
+            row["voided"] = True
+            row["void_reason"] = reason[:200]
+            row["voided_at"] = _stamp()
+            _save(data)
+            return ("payment" if kind == "payments" else "expense"), row
+    return None, None

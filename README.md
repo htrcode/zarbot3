@@ -75,6 +75,10 @@ ticket, and every button/modal re-checks the caller's department on the server s
 | `/sale add` | Record a sale → posts a **Sales Statement** to that company's channel (Company, Date, Client Name/Contact, Server Name/UUID, Service/Plan, Amount Received, Payment Method, Transaction ID, Remarks, **Total Sales** for that company) |
 | `/expense add` | Record an expense → posts an **Expense Statement** to that company's channel (Company, Date, Description, Category, Amount, Payment Method, Paid To, Transaction ID, Remarks, **Total Expenses** for that company) |
 | `/revenue` | Record revenue the same way `/expense add` works: `company`, `category` (`Commission` / `Investment` / `General`), `amount`, `description`, `received_from`, plus optional `method`, `transaction_id`, `remarks`, `date`. Posts a **Revenue Statement** (Transaction ID `REV-0001`, Company, Date, Category, Amount, Received From, Payment Method, Transaction ID / Ref, Description, Remarks, Recorded By, that company's **Total Revenue**) to that company's channel only |
+| `/expense-list [company] [include_voided]` | Recent Expense Statements with the `EXP-0001` id each one can be voided by |
+| `/expense-void entry reason` | Void a wrong Expense Statement (`entry` is `EXP-0003` or `3`). It keeps its record and audit trail but leaves the expense totals, the reports and the P&L, its finance entry is voided too, and a void notice is posted to that company's channel |
+| `/revenue-list [company] [include_voided]` | Recent Revenue Statements with the `REV-0001` id each one can be voided by |
+| `/revenue-void entry reason` | Void a wrong Revenue Statement (`entry` is `REV-0003` or `3`). It stays in the database and audit log but drops out of every total, the reports and the P&L, and a void notice is posted to that company's channel |
 | `/statement sales`, `/statement expenses` | Per-company period report (today / 7 days / 30 days / all time) with the period total |
 
 **Invoices** (`/invoice ...`)
@@ -90,8 +94,9 @@ Itemised item line: `name | quantity | unit price | type=VPS; server=Hector-VPS-
 
 **Tickets** (`/ticket ...`): `open`, `panel`, `info`, `list`, `claim`, `assign`, `note`, `priority`, `company`, `close`, `reopen`, `transcript`, `dashboard`.
 Panels have buttons: Claim, Create Invoice, Linked Ticket, Add Note, Transcript, Sales, Close/Reopen and Move.
-The dashboard shows the category, subject, client, status, priority and history — not the ticket type or the
-financial company (companies belong to the invoice / finance flows; `/ticket company` still files a ticket under one).
+The dashboard shows the category, subject, client, status, priority and history — not the ticket type, the
+financial company or the sales-pipeline line (companies belong to the invoice / finance flows, `/ticket company`
+still files a ticket under one, and the **Sales** button opens the deal).
 **Move** opens one form asking for the **destination category** and a **reason** (the channel name is optional):
 the same channel moves with its messages, history and owner, the reason is saved as a timestamped dashboard note
 (including who moved it) and in the move history, the destination department gains access while the previous one
@@ -123,7 +128,17 @@ the draw happens automatically within ~30 seconds of the end time and pings only
 `income`/`expense` require a company; `transactions`, `dashboard` and `pnl` accept an optional company
 (omitted = all companies). Revenue recorded with `/revenue` belongs to that company's P&L for its own month:
 Operating Revenue is split into the recorded income categories and the `Commission` / `General` revenue
-statement lines, and `Investment` is shown on its own line because capital is never revenue or profit.
+statement lines. `Investment` is never revenue or profit, but it is not hidden either: the dashboard and the
+P&L PDF give it its own line with its own **Total investment**, and both show a
+**Total received (revenue + investment)** beside the revenue-only totals.
+
+Wrong entries are cancelled, never deleted: `/expense-void <EXP id> <reason>` reverses an Expense
+Statement (find the id with `/expense-list`), `/revenue-void` reverses a Revenue Statement and
+`/finance void <transaction id> <reason>` reverses an income/expense entry (find the id with
+`/finance transactions`). A voided entry keeps its record and audit-log line but is left out of the
+dashboard, the P&L, the statement totals and the period statements — `/finance void` also cancels
+the matching Sales / Expense statement entry, so the two books never disagree. To correct a
+miscategorised entry, void it and record it again.
 
 ## Companies (multi-company finance)
 

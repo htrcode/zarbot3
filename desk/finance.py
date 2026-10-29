@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
+import data as store
 from desk.bridge import record_finance
 from desk.pdf_gen import pnl_pdf
 from desk.utils import (company_choices, fmt, parse_date, require_company, staff_interaction_check,
@@ -44,7 +45,7 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
         try:
             posted, message = await record_finance(
                 self.bot, kind, category, cents, description, when,
-                interaction.user.display_name, company_id=company.key)
+                interaction.user.display_name, company_id=company.key, txn_id=tx_id)
         except Exception:
             log.exception("Could not post the %s statement", kind)
             posted, message = False, "an unexpected error (it was logged)"
@@ -101,7 +102,7 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
         await ui.say(interaction, f"✅ Added {kind.value} category **{name}**.")
 
     # ---------- history ----------
-    @app_commands.command(name="transactions", description="Transaction history for a month")
+    @app_commands.command(name="transactions", description="Transaction history for a month (with the ids void takes)")
     @app_commands.describe(company="Only show this company's transactions (default: all companies)")
     @app_commands.choices(kind=KIND_CHOICES, company=company_choices())
     async def transactions(self, interaction: discord.Interaction, month: Optional[str] = None,
@@ -120,13 +121,33 @@ class Finance(commands.GroupCog, group_name="finance", group_description="Income
         await interaction.response.send_message(
             view=simple_card(title, "\n".join(lines) or "No transactions."), ephemeral=True)
 
-    @app_commands.command(name="void", description="Void a manual transaction (never deleted, kept in audit log)")
+    @app_commands.command(name="void", description="Void a wrong income/expense entry so it leaves every total")
+    @app_commands.describe(transaction_id="Transaction id (see /finance transactions)",
+                           reason="Why it is being voided")
     async def void(self, interaction: discord.Interaction, transaction_id: int, reason: str):
+        if not reason.strip():
+            return await ui.say(interaction, "❌ Say why this entry is being voided.")
         try:
-            await self.bot.db.void_transaction(interaction.user.id, transaction_id, reason)
+            row = await self.bot.db.void_transaction(interaction.user.id, transaction_id, reason)
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
-        await ui.say(interaction, f"⚫ Transaction #{transaction_id} voided.")
+        # The statement ledger holds the same entry; cancel it too so the Sales /
+        # Expense statements and their running totals stop counting it.
+        note = " It was not linked to a statement entry."
+        try:
+            kind, _entry = store.void_by_ref(f"tx:{transaction_id}", reason)
+        except Exception:
+            log.exception("Could not void the linked statement entry")
+            kind = None
+            note = " ⚠️ Its statement entry could not be voided (it was logged)."
+        if kind:
+            note = " Its statement entry was voided too."
+        label = "Income" if (row or {}).get("kind") == "income" else "Expense"
+        await ui.say(interaction, f"⚫ {label} #{transaction_id} voided\n"
+                     f"{ui._field('Amount', fmt((row or {}).get('amount') or 0))}\n"
+                     f"{ui._field('Company', config.company_name((row or {}).get('company_id')))}\n"
+                     f"{ui._field('Reason', reason)}\n"
+                     f"-# Removed from totals, reports and the P&L.{note}")
 
     @app_commands.command(name="audit", description="Recent audit log entries")
     async def audit(self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 25] = 15):
