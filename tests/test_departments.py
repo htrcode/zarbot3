@@ -436,6 +436,11 @@ class MoveModalTests(_Departments, unittest.TestCase):
         self.assertTrue(labels["Destination category"]["required"])
         self.assertEqual(labels["Reason for moving"]["custom_id"], "move:reason")
         self.assertTrue(labels["Reason for moving"]["required"])
+        # Discord rejects a TextInput that also sets its own label inside a Label
+        # (50035: "Cannot set label on a TextInput in a Label component").
+        for caption in ("Reason for moving", "Channel name (optional)"):
+            self.assertIn(caption, labels)
+            self.assertNotIn("label", labels[caption])
         self.assertEqual(sorted(o["label"] for o in labels["Destination category"]["options"]),
                          ["Billing", "Technical Support"])
         self.assertEqual([o["label"] for o in labels["Destination category"]["options"]

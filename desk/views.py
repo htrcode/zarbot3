@@ -547,6 +547,21 @@ class FollowUpTicketModal(discord.ui.Modal, title="New linked ticket"):
                                   details=self.details.value, parent_id=self.parent_id)
 
 
+class _LabelInput(discord.ui.TextInput):
+    """Text input meant to live inside a :class:`discord.ui.Label`.
+
+    Discord rejects the ``label`` field on a TextInput nested in a Label (error
+    50035), while discord.py still serialises ``label: null`` when it is unset,
+    so the key is dropped here instead.
+    """
+
+    def to_component_dict(self):
+        payload = super().to_component_dict()
+        if payload.get("label") is None:
+            payload.pop("label", None)
+        return payload
+
+
 class MoveTicketModal(discord.ui.Modal):
     """Move a ticket: the destination category and the reason are both required.
 
@@ -563,12 +578,14 @@ class MoveTicketModal(discord.ui.Modal):
                    for key, (label, _var, cid) in config.TICKET_CATEGORIES.items() if cid]
         self.destination = discord.ui.Select(custom_id="move:destination", min_values=1, max_values=1,
                                             placeholder="Destination category", options=options)
-        self.reason = discord.ui.TextInput(
-            custom_id="move:reason", label="Reason for moving", required=True, max_length=300,
+        # Wrapped in a Label below, so the caption comes from the Label and these
+        # inputs must not carry a label of their own.
+        self.reason = _LabelInput(
+            custom_id="move:reason", required=True, max_length=300,
             style=discord.TextStyle.paragraph,
             placeholder="Client paid in full — hand this over to Technical Support")
-        self.new_name = discord.ui.TextInput(
-            custom_id="move:name", label="Channel name (optional)", required=False, max_length=90,
+        self.new_name = _LabelInput(
+            custom_id="move:name", required=False, max_length=90,
             placeholder="Leave unchanged to keep the current name")
         if getattr(channel, "name", ""):
             self.new_name.default = channel.name[:90]
@@ -578,7 +595,7 @@ class MoveTicketModal(discord.ui.Modal):
         self.add_item(discord.ui.Label(
             text="Reason for moving", component=self.reason,
             description="Saved on the dashboard and in the move history"))
-        self.add_item(discord.ui.Label(text="Channel name", component=self.new_name))
+        self.add_item(discord.ui.Label(text="Channel name (optional)", component=self.new_name))
 
     async def on_submit(self, interaction: discord.Interaction):
         # Answer the form immediately: moving edits a real channel and channel edits
