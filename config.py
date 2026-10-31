@@ -17,6 +17,7 @@ Do not commit your real token to a public repository.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -262,6 +263,246 @@ TICKET_MAX_OPEN_PER_USER: int = _number("TICKET_MAX_OPEN_PER_USER", TICKET_MAX_O
 _tdir = Path(_env("TICKET_TRANSCRIPT_DIR") or "data/transcripts")
 TICKET_TRANSCRIPT_DIR: str = str(_tdir if _tdir.is_absolute() else BASE_DIR / _tdir)
 
+# ---- per-guild ticket systems ---------------------------------------------
+# Every Discord server can run its own ticket system: its own categories, staff
+# roles, panel and log channels. The setup for each server lives in
+# ``ticket_guilds.json`` next to this file (copy ``ticket_guilds.example.json``
+# and fill in the ids). Servers that are not listed there cannot open or manage
+# tickets, so a category or role id is never borrowed from another server.
+#
+# When the file does not exist, the flat ``TICKET_*`` values above are used for
+# every server: that is the single-server behaviour this bot had before, so an
+# existing installation keeps working without any change.
+TICKET_GUILDS_FILE: Path = Path(_env("TICKET_GUILDS_FILE") or BASE_DIR / "ticket_guilds.json")
+TICKET_CATEGORY_LABELS: Dict[str, str] = {key: entry[0] for key, entry in TICKET_CATEGORIES.items()}
+
+
+def _as_ids(value) -> List[int]:
+    """Ids from a JSON list, a single int, or a comma separated string."""
+    if value in (None, "", 0):
+        return []
+    if isinstance(value, int):
+        return [value] if value else []
+    if isinstance(value, (list, tuple, set)):
+        found = []
+        for item in value:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                continue
+            if number:
+                found.append(number)
+        return found
+    return _ids("", value)
+
+
+def _first_id(value) -> Optional[int]:
+    found = _as_ids(value)
+    return found[0] if found else None
+
+
+@dataclass(frozen=True)
+class GuildTickets:
+    """One server's ticket setup (categories, staff roles and channels).
+
+    Everything a ticket workflow needs is read from here for the guild the
+    interaction happened in, so two servers can use totally different
+    categories, roles and prefixes without touching each other.
+    """
+
+    guild_id: Optional[int]
+    name: str
+    categories: Dict[str, int]           # category key -> Discord category id
+    department_roles: Dict[str, List[int]]
+    staff_role_ids: tuple = ()
+    cross_department_role_ids: tuple = ()
+    log_channel_id: Optional[int] = None
+    closed_category_id: Optional[int] = None
+    panel_channel_id: Optional[int] = None
+    prefix: str = "ticket"
+    closed_prefix: str = "closed"
+    stale_days: int = 3
+    max_open_per_user: int = 3
+    source: str = "config.py"
+
+    @property
+    def configured(self) -> bool:
+        """True when this server has at least one ticket category."""
+        return bool(self.categories)
+
+    @property
+    def all_department_role_ids(self) -> List[int]:
+        return sorted({rid for ids in self.department_roles.values() for rid in ids})
+
+    def category_id(self, key) -> Optional[int]:
+        return self.categories.get(str(key or "").strip().lower())
+
+    def category_key(self, category_id) -> Optional[str]:
+        """Key of this server's category for a Discord category id (None when not ours)."""
+        if not category_id:
+            return None
+        for key, cid in self.categories.items():
+            if int(cid) == int(category_id):
+                return key
+        return None
+
+    def label(self, key) -> str:
+        return TICKET_CATEGORY_LABELS.get(str(key or "").strip().lower(), "Support")
+
+    def roles(self, key) -> List[int]:
+        return list(self.department_roles.get(str(key or "").strip().lower(), ()))
+
+    def category_hint(self, key) -> str:
+        """Where this server configures a category, for error messages."""
+        key = str(key or "").strip().lower()
+        if self.source == "ticket_guilds.json":
+            return f'`categories.{key}` in `ticket_guilds.json` (server `{self.guild_id}`)'
+        entry = TICKET_CATEGORIES.get(key)
+        return f"`{entry[1]}` in config.py" if entry else "`ticket_guilds.json`"
+
+    def roles_hint(self, key) -> str:
+        key = str(key or "").strip().lower()
+        if self.source == "ticket_guilds.json":
+            return f'`department_roles.{key}` in `ticket_guilds.json` (server `{self.guild_id}`)'
+        return f"`{TICKET_DEPARTMENT_ROLE_ENV.get(key, 'TICKET_STAFF_ROLE_IDS')}` in config.py"
+
+    def can_manage(self, member, department: Optional[str] = None) -> bool:
+        """Department-scoped staff check for THIS server only."""
+        if member is None:
+            return False
+        permissions = getattr(member, "guild_permissions", None)
+        if permissions is not None and (permissions.administrator or permissions.manage_channels):
+            return True
+        role_ids = {role.id for role in getattr(member, "roles", ()) or ()}
+        if role_ids & set(self.staff_role_ids):
+            return True
+        if role_ids & set(self.cross_department_role_ids):
+            return True
+        if department:
+            return bool(role_ids & set(self.roles(department)))
+        # A ticket outside every configured department: any of this server's
+        # department staff may help.
+        return bool(role_ids & set(self.all_department_role_ids))
+
+    def is_ticket_staff(self, member) -> bool:
+        return self.can_manage(member)
+
+
+def _flat_tickets(guild_id: Optional[int]) -> GuildTickets:
+    """The single-server setup from the flat ``TICKET_*`` values above.
+
+    Built fresh on every call so a reloaded or edited setting is picked up (and
+    so tests can patch the module globals).
+    """
+    return GuildTickets(
+        guild_id=guild_id,
+        name="config.py (single server)",
+        categories={key: cid for key, (_label, _var, cid) in TICKET_CATEGORIES.items() if cid},
+        department_roles={key: list(ids) for key, ids in TICKET_DEPARTMENT_ROLE_IDS.items() if ids},
+        staff_role_ids=tuple(sorted(set(TICKET_STAFF_ROLE_IDS) | set(STAFF_ROLE_IDS))),
+        cross_department_role_ids=tuple(TICKET_CROSS_DEPARTMENT_ROLE_IDS),
+        log_channel_id=TICKET_LOG_CHANNEL_ID,
+        closed_category_id=TICKET_CLOSED_CATEGORY_ID,
+        prefix=TICKET_PREFIX,
+        closed_prefix=TICKET_CLOSED_PREFIX,
+        stale_days=TICKET_STALE_DAYS,
+        max_open_per_user=TICKET_MAX_OPEN_PER_USER,
+        source="config.py",
+    )
+
+
+def _parse_guild_tickets(guild_id: int, raw: dict) -> GuildTickets:
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"ticket_guilds.json: the entry for server {guild_id} must be an object.")
+    categories: Dict[str, int] = {}
+    for key, value in (raw.get("categories") or {}).items():
+        key = str(key).strip().lower()
+        if key not in TICKET_CATEGORIES:
+            continue  # unknown department: ignored, /ticket setup lists the valid keys
+        cid = _first_id(value)
+        if cid:
+            categories[key] = cid
+    department_roles: Dict[str, List[int]] = {}
+    for key, value in (raw.get("department_roles") or {}).items():
+        key = str(key).strip().lower()
+        if key in TICKET_CATEGORIES:
+            ids = _as_ids(value)
+            if ids:
+                department_roles[key] = ids
+    try:
+        stale_days = int(raw.get("stale_days", TICKET_STALE_DAYS))
+        max_open = int(raw.get("max_open_per_user", TICKET_MAX_OPEN_PER_USER))
+    except (TypeError, ValueError):
+        raise RuntimeError(f"ticket_guilds.json: stale_days and max_open_per_user must be numbers "
+                           f"(server {guild_id}).")
+    return GuildTickets(
+        guild_id=guild_id,
+        name=str(raw.get("name") or f"server {guild_id}")[:80],
+        categories=categories,
+        department_roles=department_roles,
+        staff_role_ids=tuple(_as_ids(raw.get("staff_role_ids"))),
+        cross_department_role_ids=tuple(_as_ids(raw.get("cross_department_role_ids"))),
+        log_channel_id=_first_id(raw.get("log_channel_id")),
+        closed_category_id=_first_id(raw.get("closed_category_id")),
+        panel_channel_id=_first_id(raw.get("panel_channel_id")),
+        prefix=str(raw.get("prefix") or TICKET_PREFIX)[:20],
+        closed_prefix=str(raw.get("closed_prefix") or TICKET_CLOSED_PREFIX)[:20],
+        stale_days=max(stale_days, 1),
+        max_open_per_user=max(max_open, 0),
+        source="ticket_guilds.json",
+    )
+
+
+def _load_ticket_guilds(path: Path) -> Dict[int, GuildTickets]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{path.name} could not be read ({exc}). Fix the JSON or remove the file.")
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{path.name} must be a JSON object keyed by Discord server id.")
+    guilds: Dict[int, GuildTickets] = {}
+    for key, value in raw.items():
+        if str(key).startswith("_") or str(key).startswith("//"):
+            continue  # comments
+        try:
+            guild_id = int(key)
+        except (TypeError, ValueError):
+            raise RuntimeError(f"{path.name}: {key!r} is not a Discord server id.")
+        guilds[guild_id] = _parse_guild_tickets(guild_id, value)
+    return guilds
+
+
+#: Server id -> its ticket setup (empty when ``ticket_guilds.json`` is absent).
+TICKET_GUILDS: Dict[int, GuildTickets] = _load_ticket_guilds(TICKET_GUILDS_FILE)
+
+
+def tickets_for(guild) -> GuildTickets:
+    """Ticket configuration for a server (a Guild, a guild id, or None).
+
+    With ``ticket_guilds.json`` present only the servers listed there are
+    configured; any other server gets an empty setup so nothing leaks across
+    servers. Without the file the flat ``TICKET_*`` values apply everywhere.
+    """
+    guild_id = getattr(guild, "id", guild)
+    try:
+        guild_id = int(guild_id) if guild_id else None
+    except (TypeError, ValueError):
+        guild_id = None
+    if guild_id and guild_id in TICKET_GUILDS:
+        return TICKET_GUILDS[guild_id]
+    if TICKET_GUILDS:
+        return GuildTickets(guild_id=guild_id, name=f"unconfigured server {guild_id or '?'}",
+                            categories={}, department_roles={}, staff_role_ids=(),
+                            cross_department_role_ids=(), source="ticket_guilds.json")
+    return _flat_tickets(guild_id)
+
+
+def ticket_guild_ids() -> List[int]:
+    """Servers that have a ticket setup of their own."""
+    return sorted(TICKET_GUILDS)
+
 # ---- sales pipeline -------------------------------------------------------
 SALES_CHANNEL_ID: Optional[int] = _one("SALES_CHANNEL_ID", SALES_CHANNEL_ID) or TICKET_LOG_CHANNEL_ID or LOG_CHANNEL_ID
 FOLLOWUP_CHECK_MINUTES: int = _number("FOLLOWUP_CHECK_MINUTES", FOLLOWUP_CHECK_MINUTES)
@@ -343,9 +584,9 @@ def company_name(value) -> str:
 
 
 # ---- ticket departments ---------------------------------------------------
-def department_roles(key) -> List[int]:
-    """Staff role ids for a ticket category key (empty for an unknown/blank key)."""
-    return list(TICKET_DEPARTMENT_ROLE_IDS.get(str(key or "").strip().lower(), []))
+def department_roles(key, guild=None) -> List[int]:
+    """Staff role ids for a ticket category key in a server (empty when unset)."""
+    return tickets_for(guild).roles(key)
 
 
 def department_role_env(key) -> str:
@@ -355,15 +596,9 @@ def department_role_env(key) -> str:
 
 def department_label(key) -> str:
     """Display label of a ticket category key (``Support`` when it is unknown)."""
-    entry = TICKET_CATEGORIES.get(str(key or "").strip().lower())
-    return entry[0] if entry else "Support"
+    return TICKET_CATEGORY_LABELS.get(str(key or "").strip().lower(), "Support")
 
 
-def category_key(category_id) -> Optional[str]:
-    """Key of ``TICKET_CATEGORIES`` for a Discord category id (None when it is not ours)."""
-    if not category_id:
-        return None
-    for key, (_label, _var, cid) in TICKET_CATEGORIES.items():
-        if cid and int(cid) == int(category_id):
-            return key
-    return None
+def category_key(category_id, guild=None) -> Optional[str]:
+    """Key of a server's ticket category for a Discord category id (None when not ours)."""
+    return tickets_for(guild).category_key(category_id)

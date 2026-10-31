@@ -7,7 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import aiosqlite
 
-from config import CURRENCY, INVOICE_PREFIX, TICKET_PREFIX
+from config import CURRENCY, INVOICE_PREFIX, TICKET_PREFIX, tickets_for
 from desk.utils import STAGE_META, fmt, normalize_stage, today
 
 log = logging.getLogger("invoice-bot.db")
@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE TABLE IF NOT EXISTS tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    guild_seq INTEGER,
     subject TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'support',
     priority TEXT NOT NULL DEFAULT 'normal',
@@ -162,6 +164,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE TABLE IF NOT EXISTS ticket_notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+    guild_id INTEGER,
     author_id INTEGER NOT NULL,
     note TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -233,7 +236,9 @@ NEW_COLUMNS = {
                 "remarks": "TEXT", "recorded_by": "TEXT", "void_reason": "TEXT",
                 "voided_at": "TEXT"},
     "tickets": {"purchase_completed_at": "TEXT", "panel_message_id": "INTEGER",
-                "company_id": "TEXT"},
+                "company_id": "TEXT", "guild_id": "INTEGER", "guild_seq": "INTEGER"},
+    "ticket_notes": {"guild_id": "INTEGER"},
+    "audit_log": {"guild_id": "INTEGER"},
     "invoice_items": {
         "details": "TEXT", "product_type": "TEXT", "service_name": "TEXT",
         "node": "TEXT", "plan": "TEXT", "server_id": "TEXT", "delivery_link": "TEXT",
@@ -245,8 +250,23 @@ def invoice_number(invoice_id: int) -> str:
     return f"{INVOICE_PREFIX}-{invoice_id:05d}"
 
 
+#: ticket id -> its per-server display label ("TICKET-0001"), filled from the
+#: database at startup and whenever a ticket is created. Ticket numbers restart
+#: in every server, so the label cannot be derived from the global row id.
+_TICKET_LABELS: dict[int, str] = {}
+
+
+def remember_ticket_label(ticket_id: int, guild_seq: int | None, guild_id: int | None = None) -> str:
+    """Build and cache a ticket's display label (``TICKET_PREFIX`` is per server)."""
+    prefix = tickets_for(guild_id).prefix if guild_id else TICKET_PREFIX
+    label = f"{prefix}-{int(guild_seq or ticket_id):04d}"
+    _TICKET_LABELS[int(ticket_id)] = label
+    return label
+
+
 def ticket_number(ticket_id: int) -> str:
-    return f"{TICKET_PREFIX}-{ticket_id:04d}"
+    """Number shown to staff: per-server sequence when known, else the row id."""
+    return _TICKET_LABELS.get(int(ticket_id)) or f"{TICKET_PREFIX}-{int(ticket_id):04d}"
 
 
 def revenue_number(revenue_id: int) -> str:
@@ -305,11 +325,64 @@ class Database:
             for col, decl in columns.items():
                 if col not in existing:
                     await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_guild ON tickets(guild_id)")
         for name, kind in DEFAULT_CATEGORIES:
             await self.conn.execute(
                 "INSERT OR IGNORE INTO categories(name, kind) VALUES (?, ?)", (name, kind)
             )
         await self.conn.commit()
+        await self._load_ticket_labels()
+
+    async def _load_ticket_labels(self) -> None:
+        """Cache every ticket's per-server number so ``ticket_number(id)`` is correct."""
+        _TICKET_LABELS.clear()
+        rows = await self.fetchall("SELECT id, guild_id, guild_seq FROM tickets")
+        for row in rows:
+            if row["guild_seq"]:
+                remember_ticket_label(row["id"], row["guild_seq"], row["guild_id"])
+
+    async def assign_ticket_guilds(self, resolve, default_guild_id: int | None = None) -> int:
+        """Fill ``guild_id``/``guild_seq`` for tickets created before multi-server support.
+
+        ``resolve(channel_id) -> guild_id | None`` looks a ticket channel up in the
+        bot's cache. When a channel is gone and only one server is known, that
+        server is used (reliable only in that single-server case); otherwise the
+        ticket keeps a NULL guild rather than being guessed into the wrong books.
+        Numbers are then assigned per server in opening order.
+        """
+        rows = await self.fetchall("SELECT id, channel_id, guild_id FROM tickets")
+        known = {row["guild_id"] for row in rows if row["guild_id"]}
+        assigned = 0
+        for row in rows:
+            if row["guild_id"]:
+                continue
+            guild_id = resolve(row["channel_id"]) if row["channel_id"] else None
+            if guild_id is None and default_guild_id is not None and len(known) <= 1:
+                guild_id = default_guild_id
+            if not guild_id:
+                continue
+            await self.conn.execute(
+                "UPDATE tickets SET guild_id=? WHERE id=? AND guild_id IS NULL", (guild_id, row["id"])
+            )
+            known.add(guild_id)
+            assigned += 1
+        await self.conn.commit()
+        guild_ids = [r["guild_id"] for r in await self.fetchall(
+            "SELECT DISTINCT guild_id FROM tickets WHERE guild_id IS NOT NULL")]
+        for guild_id in guild_ids:
+            row = await self.fetchone(
+                "SELECT COALESCE(MAX(guild_seq),0) AS last FROM tickets WHERE guild_id=?", (guild_id,))
+            number = row["last"] if row else 0
+            missing = await self.fetchall(
+                "SELECT id FROM tickets WHERE guild_id=? AND guild_seq IS NULL ORDER BY id", (guild_id,))
+            for pending in missing:
+                number += 1
+                await self.conn.execute(
+                    "UPDATE tickets SET guild_seq=? WHERE id=? AND guild_seq IS NULL", (number, pending["id"])
+                )
+        await self.conn.commit()
+        await self._load_ticket_labels()
+        return assigned
 
     async def close(self):
         for task in list(self._event_tasks):
@@ -326,9 +399,15 @@ class Database:
             return await cur.fetchone()
 
     async def _audit(self, actor_id, action, entity, entity_id, details=None):
+        """Write an audit line; ticket lines also record the server the ticket belongs to."""
+        guild_id = None
+        if entity == "ticket" and entity_id:
+            owner = await self.fetchone("SELECT guild_id FROM tickets WHERE id=?", (entity_id,))
+            guild_id = owner["guild_id"] if owner else None
         await self.conn.execute(
-            "INSERT INTO audit_log(actor_id, action, entity, entity_id, details) VALUES (?,?,?,?,?)",
-            (actor_id, action, entity, entity_id, json.dumps(details or {}, default=str)),
+            "INSERT INTO audit_log(actor_id, action, entity, entity_id, details, guild_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (actor_id, action, entity, entity_id, json.dumps(details or {}, default=str), guild_id),
         )
 
     # ---------- event listeners (channel feeds are driven from here) ----------
@@ -638,22 +717,32 @@ class Database:
 
     # ---------- tickets ----------
     async def create_ticket(self, actor_id, *, subject, kind, priority, client_discord_id, client_name,
-                            channel_id, parent_ticket_id=None, budget=0, service="", note="", company_id=None):
+                            channel_id, parent_ticket_id=None, budget=0, service="", note="", company_id=None,
+                            guild_id=None):
         async with self.lock:
             try:
                 now = today().isoformat()
+                guild_id = int(guild_id) if guild_id else None
+                # Ticket numbers restart at 1 in every server.
+                seq_row = await self.fetchone(
+                    "SELECT COALESCE(MAX(guild_seq),0)+1 AS next FROM tickets WHERE guild_id IS ?",
+                    (guild_id,),
+                )
+                guild_seq = seq_row["next"] if seq_row else 1
                 cur = await self.conn.execute(
                     """INSERT INTO tickets(subject, kind, priority, status, client_discord_id, client_name,
-                       channel_id, parent_ticket_id, company_id, opened_by, last_activity)
-                       VALUES (?,?,?, 'open', ?,?,?,?,?,?,?)""",
+                       channel_id, parent_ticket_id, company_id, opened_by, last_activity, guild_id, guild_seq)
+                       VALUES (?,?,?, 'open', ?,?,?,?,?,?,?,?,?)""",
                     (subject[:120], kind, priority, client_discord_id, client_name[:100], channel_id,
-                     parent_ticket_id, (company_id or None), actor_id, now),
+                     parent_ticket_id, (company_id or None), actor_id, now, guild_id, guild_seq),
                 )
                 ticket_id = cur.lastrowid
+                remember_ticket_label(ticket_id, guild_seq, guild_id)
                 if note:
                     await self.conn.execute(
-                        "INSERT INTO ticket_notes(ticket_id, author_id, note) VALUES (?,?,?)",
-                        (ticket_id, actor_id, note[:1500]),
+                        "INSERT INTO ticket_notes(ticket_id, author_id, note, guild_id) "
+                        "VALUES (?,?,?,(SELECT guild_id FROM tickets WHERE id=?))",
+                        (ticket_id, actor_id, note[:1500], ticket_id),
                     )
                 if kind in ("purchase", "enquiry"):
                     # Enquiries get a follow-up today; purchases get a delivery check tomorrow.
@@ -671,8 +760,10 @@ class Database:
                                            f"{kind.title()} ticket {ticket_number(ticket_id)} opened")
                 if parent_ticket_id:
                     await self.conn.execute(
-                        "INSERT INTO ticket_notes(ticket_id, author_id, note) VALUES (?,?,?)",
-                        (parent_ticket_id, actor_id, f"Follow-up ticket {ticket_number(ticket_id)} created."),
+                        "INSERT INTO ticket_notes(ticket_id, author_id, note, guild_id) "
+                        "VALUES (?,?,?,(SELECT guild_id FROM tickets WHERE id=?))",
+                        (parent_ticket_id, actor_id,
+                         f"Follow-up ticket {ticket_number(ticket_id)} created.", parent_ticket_id),
                     )
                 await self._audit(actor_id, "ticket.create", "ticket", ticket_id,
                                   {"kind": kind, "client": client_name, "parent": parent_ticket_id})
@@ -696,9 +787,12 @@ class Database:
         return dict(row) if row else None
 
     async def list_tickets(self, status: str | None = "open", kind: str | None = None,
-                           client_id: int | None = None, limit: int = 25):
+                           client_id: int | None = None, limit: int = 25, guild_id: int | None = None):
         sql = "SELECT * FROM tickets WHERE 1=1"
         params: list = []
+        if guild_id:
+            sql += " AND guild_id=?"
+            params.append(guild_id)
         if status and status != "all":
             sql += " AND status=?"
             params.append(status)
@@ -723,32 +817,41 @@ class Database:
         )
         return dict(row) if row else None
 
-    async def ticket_stats(self) -> dict:
-        row = await self.fetchone(
-            """SELECT
+    async def ticket_stats(self, guild_id: int | None = None) -> dict:
+        sql = """SELECT
                  SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open,
                  SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
                  SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) AS closed,
                  SUM(CASE WHEN status!='closed' AND claimed_by IS NULL THEN 1 ELSE 0 END) AS unclaimed
                FROM tickets"""
-        )
+        params: tuple = ()
+        if guild_id:
+            sql += " WHERE guild_id=?"
+            params = (guild_id,)
+        row = await self.fetchone(sql, params)
         stats = {k: (row[k] or 0) for k in ("open", "pending", "closed", "unclaimed")}
         return stats
 
-    async def stale_tickets(self, days: int):
+    async def stale_tickets(self, days: int, guild_id: int | None = None):
         import datetime as _dt
 
         cutoff = (today() - _dt.timedelta(days=max(int(days), 1))).isoformat()
-        return [dict(r) for r in await self.fetchall(
-            """SELECT * FROM tickets WHERE status!='closed'
-               AND date(last_activity) <= date(?) ORDER BY last_activity ASC""",
-            (cutoff,),
-        )]
+        sql = """SELECT * FROM tickets WHERE status!='closed'
+                 AND date(last_activity) <= date(?)"""
+        params: list = [cutoff]
+        if guild_id:
+            sql += " AND guild_id=?"
+            params.append(guild_id)
+        sql += " ORDER BY last_activity ASC"
+        return [dict(r) for r in await self.fetchall(sql, params)]
 
-    async def count_open_tickets(self, client_id: int) -> int:
-        row = await self.fetchone(
-            "SELECT COUNT(*) AS n FROM tickets WHERE client_discord_id=? AND status!='closed'", (client_id,)
-        )
+    async def count_open_tickets(self, client_id: int, guild_id: int | None = None) -> int:
+        sql = "SELECT COUNT(*) AS n FROM tickets WHERE client_discord_id=? AND status!='closed'"
+        params: list = [client_id]
+        if guild_id:
+            sql += " AND guild_id=?"
+            params.append(guild_id)
+        row = await self.fetchone(sql, params)
         return row["n"] if row else 0
 
     async def set_ticket_status(self, actor_id, ticket_id, status, reason=None, transcript_path=None):
@@ -862,8 +965,9 @@ class Database:
     async def add_ticket_note(self, actor_id, ticket_id, note):
         async with self.lock:
             cur = await self.conn.execute(
-                "INSERT INTO ticket_notes(ticket_id, author_id, note) VALUES (?,?,?)",
-                (ticket_id, actor_id, note[:1500]),
+                "INSERT INTO ticket_notes(ticket_id, author_id, note, guild_id) "
+                "VALUES (?,?,?,(SELECT guild_id FROM tickets WHERE id=?))",
+                (ticket_id, actor_id, note[:1500], ticket_id),
             )
             await self.conn.execute(
                 "UPDATE tickets SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (ticket_id,)

@@ -569,13 +569,15 @@ class MoveTicketModal(discord.ui.Modal):
     mandatory, the channel name is optional. Nothing is moved until it is submitted.
     """
 
-    def __init__(self, ticket: dict, channel=None):
+    def __init__(self, ticket: dict, channel=None, cfg=None):
         super().__init__(title="Move ticket")
         self.ticket_id, self.channel_id = ticket["id"], ticket["channel_id"]
+        # Options come from the server this ticket lives in, never from another one.
+        self.cfg = cfg or config.tickets_for(getattr(channel, "guild", None))
         current = getattr(channel, "category_id", None)
-        options = [discord.SelectOption(label=label, value=key,
+        options = [discord.SelectOption(label=self.cfg.label(key), value=key,
                                         description="Current category" if cid == current else None)
-                   for key, (label, _var, cid) in config.TICKET_CATEGORIES.items() if cid]
+                   for key, cid in self.cfg.categories.items() if cid]
         self.destination = discord.ui.Select(custom_id="move:destination", min_values=1, max_values=1,
                                             placeholder="Destination category", options=options)
         # Wrapped in a Label below, so the caption comes from the Label and these
@@ -609,7 +611,7 @@ class MoveTicketModal(discord.ui.Modal):
         if not await service.guard(interaction):
             return
         key = (getattr(self.destination, "values", None) or [""])[0]
-        if key not in config.TICKET_CATEGORIES:
+        if key not in self.cfg.categories:
             return await ui.say(interaction, "❌ Pick a destination category.")
         reason = (self.reason.value or "").strip()
         if not reason:
@@ -681,11 +683,12 @@ class TicketPanelView(discord.ui.LayoutView):
     async def _staff(self, interaction) -> bool:
         """Department check: only this ticket's department (or cross-department staff) may use it."""
         service = getattr(self.bot, "tickets", None)
-        department = config.category_key(getattr(interaction.channel, "category_id", None))
+        cfg = config.tickets_for(interaction.guild)
+        department = cfg.category_key(getattr(interaction.channel, "category_id", None))
         if service is not None:
             if service.can_manage(interaction.user, interaction.guild, department):
                 return True
-        elif is_ticket_staff(interaction.user):
+        elif cfg.is_ticket_staff(interaction.user):
             return True
         await ui.say(interaction, "🚫 This ticket belongs to another department.")
         return False
@@ -721,10 +724,12 @@ class TicketPanelView(discord.ui.LayoutView):
         ticket = self.ticket
         if not ticket or ticket.get("status") == "closed":
             return await ui.say(interaction, "ℹ️ This ticket is closed. Reopen it before moving it.")
-        if not any(cid for _, _, cid in config.TICKET_CATEGORIES.values()):
-            return await ui.say(interaction, "❌ No ticket categories are configured. Set the `TICKET_*_CATEGORY_ID` values in config.py.")
+        cfg = config.tickets_for(interaction.guild)
+        if not cfg.categories:
+            return await ui.say(interaction, "❌ This server has no ticket categories configured yet. "
+                                            f"Add them to `{cfg.source}`, then restart the bot.")
         try:
-            await interaction.response.send_modal(MoveTicketModal(ticket, interaction.channel))
+            await interaction.response.send_modal(MoveTicketModal(ticket, interaction.channel, cfg))
         except Exception as exc:  # never leave the click unanswered
             log.exception("Could not open the move form for ticket %s", self.ticket_id)
             await ui.say(interaction, f"❌ I could not open the move form (`{exc}`). Try again, or "

@@ -66,6 +66,56 @@ hands access from the previous department to the destination one. The channel pe
 overwrites are the enforcement point, so an unrelated department cannot even read the
 ticket, and every button/modal re-checks the caller's department on the server side.
 
+### Multiple servers (one ticket system per server)
+
+To run the ticket system in more than one server, copy `ticket_guilds.example.json` to
+`ticket_guilds.json` next to `config.py` and give every server its own block, keyed by its
+server (guild) id:
+
+```json
+{
+  "111111111111111111": {
+    "name": "First server",
+    "panel_channel_id": 0,
+    "staff_role_ids": [],
+    "cross_department_role_ids": [],
+    "log_channel_id": 0,
+    "closed_category_id": 0,
+    "prefix": "ticket",
+    "closed_prefix": "closed",
+    "stale_days": 3,
+    "max_open_per_user": 3,
+    "categories": {
+      "tickets": 0, "billing": 0, "support": 0, "partnership": 0,
+      "recruitment": 0, "active": 0, "outdated": 0, "followup": 0
+    },
+    "department_roles": {
+      "tickets": [], "billing": [], "support": [], "partnership": [],
+      "recruitment": [], "active": [], "outdated": [], "followup": []
+    }
+  },
+  "222222222222222222": { "...": "same shape, with that server's ids" }
+}
+```
+
+* Each server has **its own** categories, department staff roles, panel / log / closed
+  channels, ticket prefix, number sequence (`ticket-0001` in both servers), stale-ticket
+  age and open-ticket limit.
+* A category, channel or role id is only ever resolved inside the server the command ran
+  in, so one server can never use another server's ids. A server that is **not** listed in
+  `ticket_guilds.json` has no ticket system: `/ticket open` and the panel say so instead of
+  falling back to someone else's setup.
+* When the file exists it replaces the flat `TICKET_*` settings above. Without it those
+  settings still apply to every server, so an existing single-server install needs no
+  change at all.
+* `/ticket setup` shows the resolved setup for the current server plus every missing or
+  invalid category / role / channel id; the same problems are logged at startup.
+* `/ticket panel` posts to that server's `panel_channel_id` unless you pass `channel:`.
+* Existing tickets are attached to their server on the first start (`guild_id`), numbered
+  per server, and their history/notes/audit lines record that server too. The database is
+  migrated in place (new `guild_id` / `guild_seq` columns); nothing is deleted or renumbered
+  twice.
+
 ## Commands
 
 **Statements** (all company-scoped: pick `company:` every time)
@@ -92,7 +142,8 @@ ticket, and every button/modal re-checks the caller's department on the server s
 
 Itemised item line: `name | quantity | unit price | type=VPS; server=Hector-VPS-12; node=Ryzen; plan=4GB; id=HX-1122; link=https://...`
 
-**Tickets** (`/ticket ...`): `open`, `panel`, `info`, `list`, `claim`, `assign`, `note`, `priority`, `company`, `close`, `reopen`, `transcript`, `dashboard`.
+**Tickets** (`/ticket ...`): `open`, `panel`, `setup`, `info`, `list`, `claim`, `assign`, `note`, `priority`, `company`, `close`, `reopen`, `transcript`, `dashboard`.
+All of them use the ticket setup of the server the command runs in (`ticket_guilds.json`, or the flat `TICKET_*` settings when that file is absent).
 Panels have buttons: Claim, Create Invoice, Linked Ticket, Add Note, Transcript, Sales, Close/Reopen and Move.
 The dashboard shows the category, subject, client, status, priority and history — not the ticket type, the
 financial company or the sales-pipeline line (companies belong to the invoice / finance flows, `/ticket company`

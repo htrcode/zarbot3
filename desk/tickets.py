@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 import config
 import ui
 from desk.database import ticket_number
-from desk.utils import (TICKET_KINDS, TICKET_PRIORITIES, company_choices, days_since, fmt,
+from desk.utils import (TICKET_KINDS, TICKET_PRIORITIES, company_choices, days_since, fmt, is_staff,
                    is_ticket_staff, now_iso, safe_channel_name, staff_interaction_check, to_cents)
 from desk.views import TicketOpenPanelView, build_ticket_view, simple_card
 
@@ -45,7 +45,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
     async def cog_load(self):
         self.bot.db.subscribe(self._on_db_event)  # dashboards follow database changes
-        if not config.TICKET_DEFAULT_CATEGORY_ID:
+        if not config.TICKET_GUILDS and not config.TICKET_DEFAULT_CATEGORY_ID:
             log.warning("TICKET_DEFAULT_CATEGORY_ID is not set: new tickets go to the Billing category "
                         "(TICKET_CATEGORY_ID) or the server root.")
         # Re-attach button handlers so panels keep working after a restart.
@@ -57,6 +57,22 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 self.bot.add_view(view)
         log.info("Restored %s ticket panels", len(rows))
 
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Once the guild cache exists: attach old tickets to their server, report bad setups."""
+        await self._backfill_guilds()
+        if not config.TICKET_GUILDS:
+            return
+        log.info("Ticket systems configured for server(s): %s",
+                 ", ".join(map(str, config.ticket_guild_ids())))
+        for guild_id in config.ticket_guild_ids():
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                log.warning("ticket_guilds.json configures server %s, but the bot is not in it", guild_id)
+                continue
+            for issue in self.config_issues(guild):
+                log.warning("Ticket setup · %s: %s", guild.name, issue)
+
     async def cog_unload(self):
         self.stale_digest.cancel()
         try:
@@ -67,12 +83,78 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             task.cancel()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Staff check: this server's ticket roles first, then the global staff roles."""
+        cfg = config.tickets_for(interaction.guild)
+        if cfg.is_ticket_staff(interaction.user) or is_staff(interaction.user):
+            return True
         return await staff_interaction_check(interaction)
+
+    # ------------------------------------------------------------------ per-server setup
+    async def _backfill_guilds(self) -> None:
+        """Give tickets opened before multi-server support their server and number."""
+        def resolve(channel_id):
+            channel = self.bot.get_channel(channel_id) if channel_id else None
+            return getattr(getattr(channel, "guild", None), "id", None)
+
+        default_guild = config.GUILD_ID
+        if default_guild is None and len(getattr(self.bot, "guilds", ()) or ()) == 1:
+            default_guild = next(iter(self.bot.guilds)).id
+        try:
+            moved = await self.bot.db.assign_ticket_guilds(resolve, default_guild)
+            if moved:
+                log.info("Assigned %s existing ticket(s) to their server", moved)
+        except Exception:
+            log.exception("Could not assign existing tickets to their servers")
+
+    def config_issues(self, guild: discord.Guild, cfg=None) -> list[str]:
+        """Everything that would stop this server's ticket system from working.
+
+        Only this guild's cache is consulted, so a category or role id that belongs
+        to another server is reported as missing instead of being used.
+        """
+        cfg = cfg or config.tickets_for(guild)
+        if not cfg.configured:
+            return [self.unconfigured_message(guild, cfg).lstrip("❌ ")]
+        issues: list[str] = []
+        for key, cid in cfg.categories.items():
+            channel = guild.get_channel(cid)
+            if channel is None:
+                issues.append(f"{cfg.label(key)} category `{cid}` is not in this server "
+                              f"({cfg.category_hint(key)}).")
+            elif not isinstance(channel, discord.CategoryChannel):
+                issues.append(f"`{cid}` for {cfg.label(key)} is not a category channel "
+                              f"({cfg.category_hint(key)}).")
+        if cfg.closed_category_id and not isinstance(guild.get_channel(cfg.closed_category_id),
+                                                     discord.CategoryChannel):
+            issues.append(f"Closed category `{cfg.closed_category_id}` is not a category in this server.")
+        for key, role_ids in cfg.department_roles.items():
+            for role_id in role_ids:
+                if guild.get_role(role_id) is None:
+                    issues.append(f"Role `{role_id}` for {cfg.label(key)} is not in this server "
+                                  f"({cfg.roles_hint(key)}).")
+        for role_id in tuple(cfg.staff_role_ids) + tuple(cfg.cross_department_role_ids):
+            if guild.get_role(role_id) is None:
+                issues.append(f"Role `{role_id}` is configured for this server but not found in it.")
+        if cfg.panel_channel_id and guild.get_channel(cfg.panel_channel_id) is None:
+            issues.append(f"Panel channel `{cfg.panel_channel_id}` is not in this server.")
+        if cfg.log_channel_id and guild.get_channel(cfg.log_channel_id) is None:
+            issues.append(f"Log channel `{cfg.log_channel_id}` is not in this server.")
+        return issues
+
+    @staticmethod
+    def unconfigured_message(guild, cfg=None) -> str:
+        cfg = cfg or config.tickets_for(guild)
+        if config.TICKET_GUILDS:
+            return (f"❌ This server has no ticket setup yet. Add `\"{getattr(guild, 'id', guild)}\"` to "
+                    "`ticket_guilds.json` with its categories and staff roles, then restart the bot "
+                    "(copy `ticket_guilds.example.json`).")
+        return ("❌ No ticket categories are configured. Set the `TICKET_*_CATEGORY_ID` values in "
+                "config.py, or use `ticket_guilds.json` for one setup per server.")
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
     def _overwrites(guild: discord.Guild, client_id: int | None, closed: bool = False,
-                    department: Optional[str] = None, drop_roles=()):
+                    department: Optional[str] = None, drop_roles=(), cfg=None):
         """Channel permissions for a ticket channel.
 
         Access is granted to the ticket owner, the bot, the global ticket staff
@@ -81,6 +163,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         are role ids that must be denied even when their category would grant
         access — that is how the previous department is locked out on a move.
         """
+        cfg = cfg or config.tickets_for(guild)
         overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
         member = guild.get_member(client_id) if client_id else None
         target = member or (discord.Object(id=client_id) if client_id else None)
@@ -89,8 +172,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 view_channel=not closed, send_messages=not closed, attach_files=not closed,
                 read_message_history=True, add_reactions=not closed, embed_links=not closed,
             )
-        allowed = set(config.TICKET_STAFF_ROLE_IDS) | set(config.TICKET_CROSS_DEPARTMENT_ROLE_IDS)
-        allowed |= set(config.department_roles(department))
+        allowed = set(cfg.staff_role_ids) | set(cfg.cross_department_role_ids)
+        allowed |= set(cfg.roles(department))
         for role_id in allowed:
             role = guild.get_role(role_id)
             if role:
@@ -150,32 +233,21 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
     # ------------------------------------------------------------------ departments
     @staticmethod
     def department_of(channel) -> Optional[str]:
-        """Ticket category key a channel sits in (None when it is not one of ours)."""
-        return config.category_key(getattr(channel, "category_id", None))
+        """Ticket category key a channel sits in, using its own server's setup."""
+        cfg = config.tickets_for(getattr(channel, "guild", None))
+        return cfg.category_key(getattr(channel, "category_id", None))
 
     def can_manage(self, user, guild, department: Optional[str] = None) -> bool:
-        """Department-scoped staff check.
+        """Department-scoped staff check against the roles configured for ``guild``.
 
-        Administrators, the global ticket staff roles, the explicitly authorised
+        Administrators, this server's ticket staff roles, its explicitly authorised
         cross-department roles and the ticket's own department staff may manage a
         ticket. Everyone else is refused here *and* kept out of the channel by its
         permission overwrites, so they cannot read its contents either.
         """
-        roles = getattr(user, "roles", None)
-        permissions = getattr(user, "guild_permissions", None)
-        if roles is None or permissions is None:
+        if getattr(user, "roles", None) is None:
             return False
-        if permissions.administrator or permissions.manage_channels:
-            return True
-        role_ids = {role.id for role in roles}
-        if role_ids & set(config.TICKET_STAFF_ROLE_IDS):
-            return True
-        if role_ids & set(config.TICKET_CROSS_DEPARTMENT_ROLE_IDS):
-            return True
-        if department:
-            return bool(role_ids & set(config.department_roles(department)))
-        # A ticket outside every configured department: any department staff may help.
-        return bool(role_ids & set(config.ALL_DEPARTMENT_ROLE_IDS)) or is_ticket_staff(user)
+        return config.tickets_for(guild).can_manage(user, department)
 
     async def guard(self, interaction: discord.Interaction) -> bool:
         """Reply with a department warning unless the caller may manage this ticket."""
@@ -290,6 +362,10 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         guild = interaction.guild
         if guild is None:
             return None
+        cfg = config.tickets_for(guild)
+        if not cfg.configured:
+            await self._respond(interaction, self.unconfigured_message(guild, cfg))
+            return None
         kind = (kind or "support").lower()
         if kind not in TICKET_KINDS:
             await self._respond(interaction, "❌ Unknown ticket type.")
@@ -308,6 +384,9 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             if not parent:
                 await self._respond(interaction, "❌ The ticket you are following up doesn't exist.")
                 return None
+            if parent.get("guild_id") and int(parent["guild_id"]) != int(guild.id):
+                await self._respond(interaction, "❌ That ticket belongs to another server.")
+                return None
             if client is None and parent.get("client_discord_id"):
                 client = guild.get_member(parent["client_discord_id"])
                 if client is None:
@@ -322,31 +401,31 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         if client is None:
             await self._respond(interaction, "❌ Pick the client for this ticket.")
             return None
-        if not is_ticket_staff(interaction.user):
-            open_count = await self.bot.db.count_open_tickets(client.id)
-            if config.TICKET_MAX_OPEN_PER_USER and open_count >= config.TICKET_MAX_OPEN_PER_USER:
+        if not cfg.is_ticket_staff(interaction.user):
+            open_count = await self.bot.db.count_open_tickets(client.id, guild.id)
+            if cfg.max_open_per_user and open_count >= cfg.max_open_per_user:
                 await self._respond(
                     interaction,
-                    f"❌ {client.mention} already has {open_count} open tickets. "
-                    "Close one first or raise `TICKET_MAX_OPEN_PER_USER`.",
+                    f"❌ {client.mention} already has {open_count} open tickets in this server. "
+                    f"Close one first or raise `max_open_per_user` ({cfg.source}).",
                 )
                 return None
 
-        # New tickets go to the "Tickets" category (Billing / server root only if it is not configured).
-        category_id = config.TICKET_DEFAULT_CATEGORY_ID or config.TICKET_CATEGORY_ID
+        # New tickets go to THIS server's "Tickets" category (its Billing one if unset).
+        category_id = cfg.category_id("tickets") or cfg.category_id("billing")
         category = self._category(guild, category_id)
         if category_id and category is None:
             log.error("Ticket category %s was not found in guild %s", category_id, guild.id)
-            await self._respond(interaction, "❌ The tickets category is not set up correctly. "
-                                             "Please tell a staff member.")
+            await self._respond(interaction, f"❌ The Tickets category (`{category_id}`) was not found in "
+                                             f"this server. Check {cfg.category_hint('tickets')}.")
             return None
         channel = None
         try:
             channel = await guild.create_text_channel(
-                safe_channel_name(f"{config.TICKET_PREFIX}-{subject}", 90),
+                safe_channel_name(f"{cfg.prefix}-{subject}", 90),
                 category=category,
                 overwrites=self._overwrites(guild, client.id,
-                                            department=config.category_key(category_id) or "tickets"),
+                                            department=cfg.category_key(category_id) or "tickets", cfg=cfg),
                 topic=f"{kind.title()} · {subject[:100]} · client {client}"[:1024],
                 reason=f"Ticket opened by {interaction.user}",
             )
@@ -355,6 +434,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 client_discord_id=client.id, client_name=client.display_name,
                 channel_id=channel.id, parent_ticket_id=parent["id"] if parent else None,
                 budget=budget, service=service[:120], note=details, company_id=company_id,
+                guild_id=guild.id,
             )
         except discord.HTTPException as e:
             if channel:
@@ -377,7 +457,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
         label = ticket_number(ticket_id)
         try:
-            await channel.edit(name=f"{config.TICKET_PREFIX}-{ticket_id:04d}",
+            await channel.edit(name=safe_channel_name(label, 90),
                                topic=f"{label} · {kind.title()} · {subject[:90]} · client {client}"[:1024])
         except discord.HTTPException:
             log.warning("Could not rename ticket channel %s", channel.id)
@@ -457,10 +537,16 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         await asyncio.to_thread(_write)
         return path
 
-    async def _log(self, title: str, body: str = "", file_path: str | None = None):
-        """Post a flat V2 card (optionally with a transcript attached) to the ticket log channel."""
-        channel = self.bot.get_channel(config.TICKET_LOG_CHANNEL_ID) if config.TICKET_LOG_CHANNEL_ID else None
+    async def _log(self, title: str, body: str = "", file_path: str | None = None,
+                   guild_id: int | None = None):
+        """Post a card to the ticket log channel of ``guild_id``'s server only."""
+        cfg = config.tickets_for(guild_id)
+        channel = self.bot.get_channel(cfg.log_channel_id) if cfg.log_channel_id else None
         if channel is None:
+            return
+        if guild_id and getattr(getattr(channel, "guild", None), "id", guild_id) != guild_id:
+            log.warning("Ticket log channel %s is not in server %s: not posting there",
+                        cfg.log_channel_id, guild_id)
             return
         try:
             if file_path and os.path.exists(file_path):
@@ -488,6 +574,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             raise ValueError("Ticket not found.")
         if ticket["status"] == "closed":
             raise ValueError("That ticket is already closed.")
+        cfg = config.tickets_for(guild)
         channel = await self._channel(ticket.get("channel_id"))
         transcript = None
         if channel:
@@ -496,12 +583,12 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             except (ValueError, OSError) as e:
                 log.warning("Transcript failed for ticket %s: %s", ticket_id, e)
             kwargs = dict(
-                name=f"{config.TICKET_CLOSED_PREFIX}-{ticket_id:04d}",
+                name=safe_channel_name(f"{cfg.closed_prefix}-{ticket_number(ticket_id).rsplit('-', 1)[-1]}", 90),
                 overwrites=self._overwrites(guild, ticket.get("client_discord_id"), closed=True,
-                                            department=self.department_of(channel)),
+                                            department=self.department_of(channel), cfg=cfg),
                 reason=f"Closed by {actor}",
             )
-            closed_category = self._category(guild, config.TICKET_CLOSED_CATEGORY_ID)
+            closed_category = self._category(guild, cfg.closed_category_id)
             if closed_category:
                 kwargs["category"] = closed_category
                 self._moved[ticket_id] = closed_category.name
@@ -520,7 +607,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             "\n".join([ui._field("Closed By", actor.mention),
                        ui._field("Client Name", ticket["client_name"]),
                        ui._field("Type", ticket["kind"]),
-                       ui._field("Reason", reason or "—")]), transcript)
+                       ui._field("Reason", reason or "—")]), transcript, guild_id=guild.id)
         return await self.bot.db.get_ticket(ticket_id)
 
     async def reopen_ticket(self, guild: discord.Guild, ticket_id: int, actor) -> dict:
@@ -529,17 +616,18 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             raise ValueError("Ticket not found.")
         if ticket["status"] != "closed":
             raise ValueError("That ticket is not closed.")
+        cfg = config.tickets_for(guild)
         channel = await self._channel(ticket.get("channel_id"))
         if channel:
-            category = self._category(guild, config.TICKET_DEFAULT_CATEGORY_ID or config.TICKET_CATEGORY_ID)
+            category = self._category(guild, cfg.category_id("tickets") or cfg.category_id("billing"))
             kwargs = dict(
-                name=f"{config.TICKET_PREFIX}-{ticket_id:04d}",
-                # Back to the default "Tickets" category: its department keeps access,
+                name=safe_channel_name(ticket_number(ticket_id), 90),
+                # Back to this server's "Tickets" category: its department keeps access,
                 # every other department is locked out again.
                 overwrites=self._overwrites(
                     guild, ticket.get("client_discord_id"), closed=False,
-                    department=config.category_key(category.id) if category else None,
-                    drop_roles=config.ALL_DEPARTMENT_ROLE_IDS),
+                    department=cfg.category_key(category.id) if category else None,
+                    drop_roles=cfg.all_department_role_ids, cfg=cfg),
                 reason=f"Reopened by {actor}",
             )
             if category:
@@ -554,19 +642,22 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         await self.bot.db.set_ticket_status(actor.id, ticket_id, "open")
         await self._log(f"Ticket reopened · {ticket_number(ticket_id)}",
                         "\n".join([ui._field("Reopened By", actor.mention),
-                                   ui._field("Client Name", ticket["client_name"])]))
+                                   ui._field("Client Name", ticket["client_name"])]), guild_id=guild.id)
         # The existing dashboard is edited in place by the database event (no second panel).
         return await self.bot.db.get_ticket(ticket_id)
 
     # ------------------------------------------------------------------ move / rename
-    def category_target(self, guild: discord.Guild, key: str):
-        """(label, category) for a key of config.TICKET_CATEGORIES. ValueError says what to fix."""
-        label, var, cid = config.TICKET_CATEGORIES[key]
+    def category_target(self, guild: discord.Guild, key: str, cfg=None):
+        """(label, category) for a department of THIS server. ValueError says what to fix."""
+        cfg = cfg or config.tickets_for(guild)
+        label, cid = cfg.label(key), cfg.category_id(key)
         if not cid:
-            raise ValueError(f"The {label} category is not configured. Set `{var}` in config.py.")
+            raise ValueError(f"The {label} category is not configured for this server. "
+                             f"Set {cfg.category_hint(key)}.")
         category = self._category(guild, cid)
         if category is None:
-            raise ValueError(f"The {label} category (`{cid}`) was not found in this server. Check `{var}`.")
+            raise ValueError(f"The {label} category (`{cid}`) was not found in this server. "
+                             f"Check {cfg.category_hint(key)}.")
         return label, category
 
     async def move_ticket(self, guild: discord.Guild, ticket_id: int, actor, key: str, reason: str = "",
@@ -584,12 +675,13 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         reason = " ".join((reason or "").split())
         if not reason:
             raise ValueError("A reason for moving the ticket is required.")
+        cfg = config.tickets_for(guild)
         ticket = await self.bot.db.get_ticket(ticket_id)
         if not ticket:
             raise ValueError("Ticket not found.")
         if ticket["status"] == "closed":
             raise ValueError("That ticket is closed. Reopen it first.")
-        label, category = self.category_target(guild, key)
+        label, category = self.category_target(guild, key, cfg)
         channel = await self._channel(ticket.get("channel_id"))
         if channel is None:
             raise ValueError("The ticket channel no longer exists.")
@@ -612,9 +704,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         if "category" in changes:
             # Department handover: the destination team gets access, the previous one is denied.
             changes["overwrites"] = self._overwrites(
-                guild, ticket.get("client_discord_id"), department=key,
-                drop_roles=[rid for rid in config.ALL_DEPARTMENT_ROLE_IDS
-                            if rid not in config.department_roles(key)],
+                guild, ticket.get("client_discord_id"), department=key, cfg=cfg,
+                drop_roles=[rid for rid in cfg.all_department_role_ids if rid not in cfg.roles(key)],
             )
 
         before = {"category": getattr(channel.category, "name", None), "name": channel.name}
@@ -635,14 +726,14 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
         destination = label if "category" in changes else before["category"]
         self._moved[ticket_id] = category.name if "category" in changes else before["category"]
-        came_from = config.department_label(previous_key) if previous_key else (before["category"] or "—")
+        came_from = cfg.label(previous_key) if previous_key else (before["category"] or "—")
         who = getattr(actor, "display_name", None) or str(actor)
         where = f"#{before['name']} → #{wanted}" if "name" in changes else f"#{wanted}"
-        gain = config.department_roles(key) if "category" in changes else []
-        loss = config.department_roles(previous_key) if "category" in changes and previous_key != key else []
+        gain = cfg.roles(key) if "category" in changes else []
+        loss = cfg.roles(previous_key) if "category" in changes and previous_key != key else []
         access_note = "; ".join(part for part in (
             f"{label} staff gained access" if gain else "",
-            f"{config.department_label(previous_key)} staff lost access" if loss else "") if part) or "unchanged"
+            f"{cfg.label(previous_key)} staff lost access" if loss else "") if part) or "unchanged"
         note = f"[{now_iso()}] Moved {came_from} → **{destination}** ({where}) by {who} — reason: {reason}"
         try:
             await self.bot.db.record_ticket_move(actor.id, ticket_id, {
@@ -660,7 +751,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             ui._field("Reason", reason),
             ui._field("Category", f"{came_from} → {label}" if "category" in changes else came_from),
             ui._field("Channel", where),
-            ui._field("Access", access_note)]))
+            ui._field("Access", access_note)]), guild_id=guild.id)
         done = []
         if "category" in changes:
             done.append(f"moved to **{label}**")
@@ -689,15 +780,50 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
     @app_commands.command(name="panel", description="Post the public ticket-opening panel")
     async def panel(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-        target = channel or interaction.channel
+        cfg = config.tickets_for(interaction.guild)
+        if not cfg.configured:
+            return await ui.say(interaction, self.unconfigured_message(interaction.guild, cfg))
+        target = channel or (self.bot.get_channel(cfg.panel_channel_id) if cfg.panel_channel_id else None)
         if target is None:
-            return await ui.say(interaction, "❌ Pick a channel for the panel.")
+            return await ui.say(interaction, f"❌ Pick a channel for the panel, or set `panel_channel_id` "
+                                            f"for this server in `{cfg.source}`.")
+        if getattr(getattr(target, "guild", None), "id", interaction.guild_id) != interaction.guild_id:
+            return await ui.say(interaction, "❌ The panel has to be posted in this server.")
         await interaction.response.defer(ephemeral=True)
         try:
             await target.send(view=TicketOpenPanelView(self.bot))
         except discord.HTTPException as e:
             return await ui.say(interaction, f"❌ Could not post the panel: {e}")
         await ui.say(interaction, f"✅ Ticket panel posted in {target.mention}.")
+
+    @app_commands.command(name="setup", description="Show this server's ticket setup and any problems")
+    async def setup_cmd(self, interaction: discord.Interaction):
+        """Report the resolved per-server configuration and what needs fixing."""
+        cfg = config.tickets_for(interaction.guild)
+        if not (cfg.is_ticket_staff(interaction.user) or is_staff(interaction.user)):
+            return await ui.say(interaction, "🚫 Staff only.")
+        issues = self.config_issues(interaction.guild, cfg)
+        lines = [ui._field("Server", f"{discord.utils.escape_markdown(interaction.guild.name)} "
+                                     f"`{interaction.guild.id}`"),
+                 ui._field("Config", f"`{cfg.source}`")]
+        if cfg.categories:
+            lines += ["", "**Categories**"]
+            for key, cid in cfg.categories.items():
+                channel = interaction.guild.get_channel(cid)
+                where = f"<#{cid}>" if channel else f"`{cid}` **missing here**"
+                roles = ", ".join(f"<@&{rid}>" for rid in cfg.roles(key)) or "any ticket staff"
+                lines.append(f"• {cfg.label(key)} → {where} · {roles}")
+        if cfg.panel_channel_id:
+            lines.append(f"• Panel channel → <#{cfg.panel_channel_id}>")
+        if cfg.log_channel_id:
+            lines.append(f"• Log channel → <#{cfg.log_channel_id}>")
+        if issues:
+            lines += ["", "**Needs fixing**"] + [f"• {issue}" for issue in issues]
+        else:
+            lines += ["", "✅ Everything in this server's ticket setup resolves."]
+        await interaction.response.send_message(
+            view=simple_card(f"Ticket setup · {interaction.guild.name[:60]}", "\n".join(lines)),
+            ephemeral=True)
 
     @app_commands.command(name="info", description="Show a ticket panel")
     async def info(self, interaction: discord.Interaction, ticket: Optional[int] = None):
@@ -719,7 +845,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                        client: Optional[discord.Member] = None):
         rows = await self.bot.db.list_tickets(status.value if status else "open",
                                               kind.value if kind else None,
-                                              client.id if client else None, limit=25)
+                                              client.id if client else None, limit=25,
+                                              guild_id=interaction.guild_id)
         if not rows:
             return await interaction.response.send_message(
                 view=simple_card("Tickets", "No tickets match that filter."), ephemeral=True)
@@ -750,8 +877,10 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             row = await self._resolve(interaction, ticket)
         except ValueError as e:
             return await ui.say(interaction, f"❌ {e}")
-        if not is_ticket_staff(staff):
-            return await ui.say(interaction, "❌ That member has no ticket staff role. Add their role to `TICKET_STAFF_ROLE_IDS` first.")
+        cfg = config.tickets_for(interaction.guild)
+        if not cfg.is_ticket_staff(staff):
+            return await ui.say(interaction, "❌ That member has none of this server's ticket staff roles. "
+                                            f"Add their role to the ticket setup (`{cfg.source}`).")
         await self.bot.db.set_ticket_claimed(interaction.user.id, row["id"], staff.id)
         await ui.say(interaction, f"🙋 **{ticket_number(row['id'])}** assigned to {staff.mention}.")
 
@@ -824,9 +953,10 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
 
     @app_commands.command(name="dashboard", description="Ticket and sales overview")
     async def dashboard(self, interaction: discord.Interaction):
-        stats = await self.bot.db.ticket_stats()
+        cfg = config.tickets_for(interaction.guild)
+        stats = await self.bot.db.ticket_stats(interaction.guild_id)
         pipeline = await self.bot.db.pipeline()
-        stale = await self.bot.db.stale_tickets(config.TICKET_STALE_DAYS)
+        stale = await self.bot.db.stale_tickets(cfg.stale_days, interaction.guild_id)
         lines = [
             f"**Open:** {stats['open']}  ·  **Pending:** {stats['pending']}  ·  "
             f"**Closed:** {stats['closed']}  ·  **Unclaimed:** {stats['unclaimed']}",
@@ -841,7 +971,7 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
         total = sum(row["count"] for row in pipeline)
         if not total:
             lines.append("• No deals yet — buying-enquiry tickets create them automatically.")
-        lines += ["", f"**Stale tickets** (no activity for {config.TICKET_STALE_DAYS}+ days): {len(stale)}"]
+        lines += ["", f"**Stale tickets** (no activity for {cfg.stale_days}+ days): {len(stale)}"]
         for row in stale[:8]:
             link = f"<#{row['channel_id']}>" if row.get("channel_id") else ticket_number(row["id"])
             idle = days_since((row.get("last_activity") or "")[:10])
@@ -853,19 +983,24 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
     # ------------------------------------------------------------------ background
     @tasks.loop(hours=24)
     async def stale_digest(self):
-        try:
-            stale = await self.bot.db.stale_tickets(config.TICKET_STALE_DAYS)
-            if not stale:
-                return
-            lines = []
-            for row in stale[:15]:
-                channel = f"<#{row['channel_id']}>" if row.get("channel_id") else ticket_number(row["id"])
-                lines.append(f"• {channel} · {row['client_name']} · {row['subject'][:60]} · "
-                             f"last {row['last_activity'][:10]}")
-            await self._log(f"Stale tickets · {len(stale)}",
-                            f"No activity for {config.TICKET_STALE_DAYS}+ days:\n" + "\n".join(lines))
-        except Exception:
-            log.exception("Stale ticket digest failed")
+        for guild in list(getattr(self.bot, "guilds", ()) or ()):
+            try:
+                cfg = config.tickets_for(guild)
+                if not cfg.configured:
+                    continue
+                stale = await self.bot.db.stale_tickets(cfg.stale_days, guild.id)
+                if not stale:
+                    continue
+                lines = []
+                for row in stale[:15]:
+                    channel = f"<#{row['channel_id']}>" if row.get("channel_id") else ticket_number(row["id"])
+                    lines.append(f"• {channel} · {row['client_name']} · {row['subject'][:60]} · "
+                                 f"last {row['last_activity'][:10]}")
+                await self._log(f"Stale tickets · {len(stale)}",
+                                f"No activity for {cfg.stale_days}+ days:\n" + "\n".join(lines),
+                                guild_id=guild.id)
+            except Exception:
+                log.exception("Stale ticket digest failed for server %s", getattr(guild, "id", "?"))
 
     @stale_digest.before_loop
     async def _wait_ready(self):
@@ -881,7 +1016,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             actor_id = self.bot.user.id if self.bot.user else 0
             await self.bot.db.set_ticket_status(actor_id, ticket["id"], "closed", "Channel deleted")
             await self._log(f"Ticket closed · {ticket_number(ticket['id'])}",
-                            "The ticket channel was deleted, so the ticket was marked closed.")
+                            "The ticket channel was deleted, so the ticket was marked closed.",
+                            guild_id=ticket.get("guild_id") or getattr(channel.guild, "id", None))
         except Exception:
             log.exception("Could not close ticket for deleted channel %s", channel.id)
 

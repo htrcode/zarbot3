@@ -273,12 +273,20 @@ def is_staff(user) -> bool:
     )
 
 
-def is_ticket_staff(user) -> bool:
-    """Ticket staff = TICKET_STAFF_ROLE_IDS (falls back to STAFF_ROLE_IDS) or admins."""
-    from config import TICKET_STAFF_ROLE_IDS
+def is_ticket_staff(user, guild=None) -> bool:
+    """Ticket staff: this server's configured ticket / department roles, or admins.
+
+    Pass ``guild`` for ticket workflows so the check uses that server's own
+    roles (``ticket_guilds.json``). Without it the flat ``TICKET_STAFF_ROLE_IDS``
+    (falling back to ``STAFF_ROLE_IDS``) applies, which is the single-server
+    behaviour used by the older commands.
+    """
+    from config import TICKET_STAFF_ROLE_IDS, tickets_for
 
     if not isinstance(user, discord.Member):
         return False
+    if guild is not None:
+        return tickets_for(guild).is_ticket_staff(user)
     if user.guild_permissions.administrator or user.guild_permissions.manage_channels:
         return True
     return any(r.id in STAFF_ROLE_IDS or r.id in TICKET_STAFF_ROLE_IDS for r in user.roles)

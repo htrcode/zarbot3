@@ -246,7 +246,17 @@ class InvoiceBot(commands.Bot):
             if not company.statement_channel_id:
                 log.warning("%s is not set — %s cannot record sales, expenses, revenue or invoices until "
                             "that company has a statement channel.", company.statement_env, company.name)
-        if not config.TICKET_STAFF_ROLE_IDS:
+        service = getattr(self, "tickets", None)
+        for guild in self.guilds:
+            cfg = config.tickets_for(guild)
+            if not cfg.configured:
+                if config.TICKET_GUILDS:
+                    log.warning("Ticket system: server %s (%s) is not in ticket_guilds.json, so tickets "
+                                "are disabled there.", guild.name, guild.id)
+                continue
+            for issue in (service.config_issues(guild, cfg) if service else []):
+                log.warning("Ticket setup · %s: %s", guild.name, issue)
+        if not config.TICKET_GUILDS and not config.TICKET_STAFF_ROLE_IDS:
             log.warning("STAFF_ROLE_IDS / TICKET_STAFF_ROLE_IDS are empty: only administrators can use staff commands.")
         if not config.SALES_CHANNEL_ID:
             log.warning("SALES_CHANNEL_ID is not set: follow-up reminders cannot be posted.")
