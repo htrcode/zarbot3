@@ -109,6 +109,13 @@ TICKET_CLOSED_PREFIX = "closed"
 TICKET_STALE_DAYS = 3  # tickets idle this long show up as stale
 TICKET_MAX_OPEN_PER_USER = 3  # 0 = unlimited (staff are never limited)
 
+# Public panel content. Each server can override these in ticket_guilds.json
+# (panel_title / panel_description / panel_button).
+TICKET_PANEL_TITLE = "Need Hosting? Create a Ticket"
+TICKET_PANEL_DESCRIPTION = ("Create a ticket and our team will assist you. Our staff will identify your request "
+                            "and route your ticket to the appropriate department.")
+TICKET_PANEL_BUTTON = "Create Ticket"
+
 # --- Sales pipeline ------------------------------------------------------
 SALES_CHANNEL_ID = 0  # follow-up reminders (falls back to the ticket log / log channel)
 FOLLOWUP_CHECK_MINUTES = 30
@@ -260,6 +267,9 @@ TICKET_PREFIX: str = _text("TICKET_PREFIX", TICKET_PREFIX)
 TICKET_CLOSED_PREFIX: str = _text("TICKET_CLOSED_PREFIX", TICKET_CLOSED_PREFIX)
 TICKET_STALE_DAYS: int = _number("TICKET_STALE_DAYS", TICKET_STALE_DAYS)
 TICKET_MAX_OPEN_PER_USER: int = _number("TICKET_MAX_OPEN_PER_USER", TICKET_MAX_OPEN_PER_USER)
+TICKET_PANEL_TITLE: str = _text("TICKET_PANEL_TITLE", TICKET_PANEL_TITLE)
+TICKET_PANEL_DESCRIPTION: str = _text("TICKET_PANEL_DESCRIPTION", TICKET_PANEL_DESCRIPTION)
+TICKET_PANEL_BUTTON: str = _text("TICKET_PANEL_BUTTON", TICKET_PANEL_BUTTON)
 _tdir = Path(_env("TICKET_TRANSCRIPT_DIR") or "data/transcripts")
 TICKET_TRANSCRIPT_DIR: str = str(_tdir if _tdir.is_absolute() else BASE_DIR / _tdir)
 
@@ -319,6 +329,9 @@ class GuildTickets:
     log_channel_id: Optional[int] = None
     closed_category_id: Optional[int] = None
     panel_channel_id: Optional[int] = None
+    panel_title: str = TICKET_PANEL_TITLE
+    panel_description: str = TICKET_PANEL_DESCRIPTION
+    panel_button: str = TICKET_PANEL_BUTTON
     prefix: str = "ticket"
     closed_prefix: str = "closed"
     stale_days: int = 3
@@ -403,6 +416,9 @@ def _flat_tickets(guild_id: Optional[int]) -> GuildTickets:
         cross_department_role_ids=tuple(TICKET_CROSS_DEPARTMENT_ROLE_IDS),
         log_channel_id=TICKET_LOG_CHANNEL_ID,
         closed_category_id=TICKET_CLOSED_CATEGORY_ID,
+        panel_title=TICKET_PANEL_TITLE,
+        panel_description=TICKET_PANEL_DESCRIPTION,
+        panel_button=TICKET_PANEL_BUTTON,
         prefix=TICKET_PREFIX,
         closed_prefix=TICKET_CLOSED_PREFIX,
         stale_days=TICKET_STALE_DAYS,
@@ -445,6 +461,9 @@ def _parse_guild_tickets(guild_id: int, raw: dict) -> GuildTickets:
         log_channel_id=_first_id(raw.get("log_channel_id")),
         closed_category_id=_first_id(raw.get("closed_category_id")),
         panel_channel_id=_first_id(raw.get("panel_channel_id")),
+        panel_title=str(raw.get("panel_title") or TICKET_PANEL_TITLE)[:256],
+        panel_description=str(raw.get("panel_description") or TICKET_PANEL_DESCRIPTION)[:3500],
+        panel_button=str(raw.get("panel_button") or TICKET_PANEL_BUTTON)[:80],
         prefix=str(raw.get("prefix") or TICKET_PREFIX)[:20],
         closed_prefix=str(raw.get("closed_prefix") or TICKET_CLOSED_PREFIX)[:20],
         stale_days=max(stale_days, 1),

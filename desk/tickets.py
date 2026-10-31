@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import replace
 from typing import Optional
 
 import discord
@@ -778,8 +779,14 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
             company_id=company.value if company else None,
         )
 
-    @app_commands.command(name="panel", description="Post the public ticket-opening panel")
-    async def panel(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    @app_commands.command(name="panel", description="Post this server's public ticket-opening panel")
+    @app_commands.describe(channel="Where to post it (defaults to this server's panel channel)",
+                           title="Heading for the panel (defaults to this server's panel_title)",
+                           description="Text for the panel (line breaks are kept)",
+                           button="Button label (defaults to this server's panel_button)")
+    async def panel(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None,
+                    title: Optional[str] = None, description: Optional[str] = None,
+                    button: Optional[str] = None):
         cfg = config.tickets_for(interaction.guild)
         if not cfg.configured:
             return await ui.say(interaction, self.unconfigured_message(interaction.guild, cfg))
@@ -789,12 +796,19 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                                             f"for this server in `{cfg.source}`.")
         if getattr(getattr(target, "guild", None), "id", interaction.guild_id) != interaction.guild_id:
             return await ui.say(interaction, "❌ The panel has to be posted in this server.")
+        overridden = bool(title or description or button)
+        if overridden:
+            cfg = replace(cfg, panel_title=(title or cfg.panel_title)[:200],
+                          panel_description=(description or cfg.panel_description)[:3500],
+                          panel_button=(button or cfg.panel_button)[:80])
         await interaction.response.defer(ephemeral=True)
         try:
-            await target.send(view=TicketOpenPanelView(self.bot))
+            await target.send(view=TicketOpenPanelView(self.bot, cfg))
         except discord.HTTPException as e:
             return await ui.say(interaction, f"❌ Could not post the panel: {e}")
-        await ui.say(interaction, f"✅ Ticket panel posted in {target.mention}.")
+        hint = (f"\nThis wording applies to this post only. Put `panel_title`, `panel_description` and "
+                f"`panel_button` in `{cfg.source}` to keep it for this server." if overridden else "")
+        await ui.say(interaction, f"✅ Ticket panel posted in {target.mention}.{hint}")
 
     @app_commands.command(name="setup", description="Show this server's ticket setup and any problems")
     async def setup_cmd(self, interaction: discord.Interaction):
@@ -815,6 +829,8 @@ class Tickets(commands.GroupCog, group_name="ticket", group_description="Client 
                 lines.append(f"• {cfg.label(key)} → {where} · {roles}")
         if cfg.panel_channel_id:
             lines.append(f"• Panel channel → <#{cfg.panel_channel_id}>")
+        lines.append(f"• Panel content → **{discord.utils.escape_markdown(cfg.panel_title)}** · "
+                     f"button *{discord.utils.escape_markdown(cfg.panel_button)}*")
         if cfg.log_channel_id:
             lines.append(f"• Log channel → <#{cfg.log_channel_id}>")
         if issues:

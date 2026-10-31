@@ -77,6 +77,9 @@ server (guild) id:
   "111111111111111111": {
     "name": "First server",
     "panel_channel_id": 0,
+    "panel_title": "Need Hosting? Create a Ticket",
+    "panel_description": "Create a ticket and our team will assist you.",
+    "panel_button": "Create Ticket",
     "staff_role_ids": [],
     "cross_department_role_ids": [],
     "log_channel_id": 0,
@@ -110,7 +113,11 @@ server (guild) id:
   change at all.
 * `/ticket setup` shows the resolved setup for the current server plus every missing or
   invalid category / role / channel id; the same problems are logged at startup.
-* `/ticket panel` posts to that server's `panel_channel_id` unless you pass `channel:`.
+* `/ticket panel` posts that server's panel to its `panel_channel_id` unless you pass `channel:`.
+  The wording is per server: set `panel_title`, `panel_description` (use `\n` for line
+  breaks) and `panel_button` in that server's block. To post a one-off version without
+  touching the file, pass them to the command: `/ticket panel title:… description:… button:…`
+  — it still only posts in the server the command runs in.
 * Existing tickets are attached to their server on the first start (`guild_id`), numbered
   per server, and their history/notes/audit lines record that server too. The database is
   migrated in place (new `guild_id` / `guild_seq` columns); nothing is deleted or renumbered

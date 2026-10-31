@@ -15,6 +15,7 @@ os.environ.setdefault("INVOICE_BOT_DATA", os.path.join(_TMP, "data.json"))
 import discord  # noqa: E402
 
 import config  # noqa: E402
+from desk import views  # noqa: E402
 from desk.database import Database, ticket_number  # noqa: E402
 from desk.tickets import Tickets  # noqa: E402
 
@@ -243,6 +244,85 @@ class PerServerNumberingTests(_DatabaseCase):
         self.assertEqual(ticket_number(rows["old-b"]["id"]), "ticket-0001")
         # The migrated records are still there, just filed under their server.
         self.assertEqual(len(await self.db.list_tickets("all", guild_id=11)), 1)
+
+
+# --------------------------------------------------------------------------- panel
+class PanelContentTests(_InjectedConfig):
+    """Every server shows its own wording on the public ticket panel."""
+
+    def _cfg(self, guild_id, **panel):
+        return config._parse_guild_tickets(guild_id, {"categories": {"tickets": guild_id}, **panel})
+
+    @staticmethod
+    def _render(view):
+        texts, labels = [], []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == 10:
+                    texts.append(node.get("content", ""))
+                if node.get("type") == 2 and node.get("label"):
+                    labels.append(node["label"])
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(view.to_components())
+        return "\n".join(texts), labels
+
+    def test_each_server_parses_its_own_panel_wording(self):
+        a = self._cfg(11, panel_title="Server A help", panel_description="A only",
+                      panel_button="Get help")
+        b = self._cfg(22)
+        self.assertEqual((a.panel_title, a.panel_description, a.panel_button),
+                         ("Server A help", "A only", "Get help"))
+        # A server without panel_* keys keeps the default wording.
+        self.assertEqual((b.panel_title, b.panel_description, b.panel_button),
+                         (config.TICKET_PANEL_TITLE, config.TICKET_PANEL_DESCRIPTION,
+                          config.TICKET_PANEL_BUTTON))
+
+    def test_the_panel_view_shows_the_wording_of_its_server(self):
+        cfg = self._cfg(11, panel_title="Server A help", panel_description="A only",
+                        panel_button="Get help")
+        text, labels = self._render(views.TicketOpenPanelView(object(), cfg))
+        self.assertIn("Server A help", text)
+        self.assertIn("A only", text)
+        self.assertIn("Get help", labels)
+
+        other = self._cfg(22, panel_title="Server B help", panel_description="B only")
+        text, labels = self._render(views.TicketOpenPanelView(object(), other))
+        self.assertIn("Server B help", text)
+        self.assertNotIn("Server A help", text)
+        self.assertIn(config.TICKET_PANEL_BUTTON, labels)
+
+    def test_the_panel_view_without_config_keeps_working(self):
+        view = views.TicketOpenPanelView(object())
+        text, _labels = self._render(view)
+        self.assertIn(config.TICKET_PANEL_TITLE, text)
+        self.assertIn("ticketopen:create", {node.get("custom_id") for node in _walk(view)})
+
+    def test_the_panel_command_takes_per_server_wording(self):
+        self.assertEqual(Tickets.panel.name, "panel")
+        params = {p.name for p in Tickets.panel.parameters}
+        self.assertLessEqual({"channel", "title", "description", "button"}, params)
+
+
+def _walk(view):
+    out = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            out.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(view.to_components())
+    return out
 
 
 if __name__ == "__main__":

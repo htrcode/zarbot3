@@ -805,22 +805,27 @@ class TicketPanelView(discord.ui.LayoutView):
 
 
 class TicketOpenPanelView(discord.ui.LayoutView):
-    """Public panel customers use to open their own tickets."""
+    """Public panel customers use to open their own tickets.
 
-    def __init__(self, bot):
+    The wording comes from ``cfg`` so every server shows its own panel; when no
+    config is given the flat/default text is used (button handling only).
+    """
+
+    def __init__(self, bot, cfg=None):
         super().__init__(timeout=None)
         self.bot = bot
+        self.cfg = cfg or config.tickets_for(None)
 
         def btn(label, kind, style, emoji):
             b = discord.ui.Button(label=label, style=style, emoji=emoji, custom_id=f"ticketopen:{kind}")
             b.callback = getattr(self, f"on_{kind}")
             return b
 
-        row = discord.ui.ActionRow(btn("Create Ticket", "create", discord.ButtonStyle.success, "🎫"))
+        row = discord.ui.ActionRow(btn(self.cfg.panel_button or "Create Ticket", "create",
+                                       discord.ButtonStyle.success, "🎫"))
         items = ui.card_items(
-            "Need Hosting? Create a Ticket",
-            "Create a ticket and our team will assist you. Our staff will identify your request "
-            "and route your ticket to the appropriate department.",
+            self.cfg.panel_title or "Create a Ticket",
+            self.cfg.panel_description,
             rows=[row])
         self.add_item(discord.ui.Container(*items))
 
